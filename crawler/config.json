@@ -1,0 +1,24 @@
+{
+  "db_ssl_ca_cert_path": "/home/ubuntu/crawler/ssl/ca.pem",
+  "delay_per_domain": 1.5,
+  "max_concurrent_requests": 5,
+  "max_depth": 1,
+  "max_pages": 5,
+  "max_requests_per_minute": 2500,
+  "max_retries": 3,
+  "minio_storage": {
+    "bucket_name": "crawled",
+    "enabled": true,
+    "endpoint": "localhost:9000",
+    "secure": false
+  },
+  "output_file": "crawl_results.10m.json",
+  "save_to_db": true,
+  "save_to_json": false,
+  "ssl_verify": false,
+  "start_urls": [
+    "https://teaserverse.online",
+    "https://en.wikipedia.org/wiki/Special:AllPages"
+  ],
+  "user_agent": "Mozilla/5.0 (compatible; TeaserBot/1.1; +https://teaserverse.online/bot)"
+}

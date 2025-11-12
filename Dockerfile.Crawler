@@ -1,0 +1,30 @@
+# Sử dụng image Python nhẹ
+FROM python:3.11-slim
+
+# Cài đặt các gói hệ thống cần thiết cho C/C++ build và libpq (PostgreSQL)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    libpq-dev \
+    gcc \
+    && rm -rf /var/lib/apt/lists/*
+
+# Thiết lập thư mục làm việc
+WORKDIR /app
+
+# Copy các file config và requirements trước
+COPY crawler/requirements.txt .
+COPY crawler/schema.sql .
+
+# Cài đặt thư viện Python từ requirements.txt
+# (Bao gồm asyncpg, fasttext-wheel, minio, v.v.)
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy toàn bộ mã nguồn crawler
+COPY crawler.py .
+COPY crawler/config.json .
+COPY crawler/.gitignore .
+
+# Lệnh mặc định để chạy crawler
+# crawler.py của bạn đã có logic chờ (init_database),
+# nhưng nó sẽ chạy ngay khi container khởi động.
+CMD ["python", "crawler.py"]

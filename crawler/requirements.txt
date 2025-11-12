@@ -1,0 +1,11 @@
+aiohttp
+beautifulsoup4
+asyncpg
+aiolimiter
+minio
+python-dotenv
+rich
+fasttext-wheel
+lxml
+aiodns
+numpy==1.24.4

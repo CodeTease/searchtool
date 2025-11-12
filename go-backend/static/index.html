@@ -1,0 +1,154 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>TeaserSearch</title>
+    <style>
+        body { 
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; 
+            background-color: #f0f2f5;
+            color: #1c1e21;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            padding-top: 10vh;
+            margin: 0;
+        }
+        h1 { 
+            font-size: 48px; 
+            font-weight: 700;
+            color: #1877f2; /* Màu xanh Teaserverse/Facebook? */
+            margin: 0;
+        }
+        .container {
+            width: 100%;
+            max-width: 600px;
+            padding: 0 20px;
+            box-sizing: border-box;
+        }
+        form { 
+            width: 100%;
+            display: flex;
+            margin-top: 20px;
+        }
+        input[type="text"] {
+            flex-grow: 1;
+            padding: 14px 20px;
+            font-size: 16px;
+            border: 1px solid #dddfe2;
+            border-radius: 24px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            outline: none;
+            transition: box-shadow 0.2s;
+        }
+        input[type="text"]:focus {
+            box-shadow: 0 4px 8px rgba(0,0,0,0.15);
+        }
+        #results { 
+            width: 100%; 
+            margin-top: 30px; 
+        }
+        .result-item {
+            background-color: #fff;
+            padding: 16px;
+            border-radius: 8px;
+            margin-bottom: 12px;
+            box-shadow: 0 1px 2px rgba(0,0,0,0.1);
+        }
+        .result-item h3 {
+            margin: 0 0 4px 0;
+        }
+        .result-item a {
+            font-size: 18px;
+            color: #1d2129;
+            text-decoration: none;
+            font-weight: 600;
+        }
+        .result-item a:hover {
+            text-decoration: underline;
+        }
+        .result-item .url {
+            font-size: 14px;
+            color: #606770;
+            display: block;
+            margin-bottom: 6px;
+            word-break: break-all;
+        }
+        .result-item .snippet {
+            font-size: 15px;
+            color: #333;
+        }
+        .snippet b {
+            background-color: #fff3a3; /* Màu highlight */
+        }
+    </style>
+</head>
+<body>
+
+    <div class="container">
+        <h1>TeaserSearch</h1>
+
+        <form id="search-form">
+            <input type="text" id="search-query" placeholder="Tìm kiếm dữ liệu đã crawl..." autofocus>
+            <!-- Nút submit ẩn, dùng Enter để submit -->
+        </form>
+
+        <div id="results">
+            <!-- Kết quả tìm kiếm sẽ được chèn vào đây -->
+        </div>
+    </div>
+
+    <script>
+        const form = document.getElementById('search-form');
+        const queryInput = document.getElementById('search-query');
+        const resultsDiv = document.getElementById('results');
+
+        form.addEventListener('submit', async (e) => {
+            e.preventDefault();
+            const query = queryInput.value;
+            if (!query) return;
+
+            resultsDiv.innerHTML = '<p>Đang tìm kiếm...</p>';
+
+            try {
+                const response = await fetch(`/api/search?q=${encodeURIComponent(query)}`);
+                if (!response.ok) {
+                    throw new Error('Search request failed');
+                }
+                const results = await response.json();
+
+                if (results && results.length > 0) {
+                    displayResults(results);
+                } else if (results) {
+                    resultsDiv.innerHTML = '<p>Không tìm thấy kết quả nào.</p>';
+                } else {
+                     resultsDiv.innerHTML = '<p>Không tìm thấy kết quả nào (hoặc crawler chưa chạy).</p>';
+                }
+
+            } catch (error) {
+                console.error(error);
+                resultsDiv.innerHTML = '<p>Lỗi! Không thể thực hiện tìm kiếm.</p>';
+            }
+        });
+
+        function displayResults(results) {
+            resultsDiv.innerHTML = ''; // Xóa kết quả cũ
+            results.forEach(item => {
+                const div = document.createElement('div');
+                div.className = 'result-item';
+
+                // Snippet có thể chứa HTML (<b>), dùng innerHTML
+                // Cần đảm bảo Go backend đã sanitize (ở đây ta tin tưởng)
+                div.innerHTML = `
+                    <h3><a href="${item.url}" target="_blank">${item.title || item.url}</a></h3>
+                    <span class="url">${item.url}</span>
+                    <p class="snippet">${item.snippet || item.meta_description || 'Không có mô tả.'}</p>
+                `;
+                resultsDiv.appendChild(div);
+            });
+        }
+    </script>
+
+</body>
+</html>
