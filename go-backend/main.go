@@ -152,8 +152,9 @@ func searchHandler(c echo.Context) error {
 		AttributesToHighlight: []string{"*"}, // Highlight tất cả các thuộc tính
 		HighlightPreTag:      "<b>",
 		HighlightPostTag:     "</b>",
-		AttributesToSnippet:  []string{"body_text:15"}, // Snippet từ body_text, 15 từ
-		SnippetEllipsisText:  "...",
+		AttributesToCrop:     []string{"body_text"},
+		CropLength:           15,
+		CropMarker:           "...",
 	}
 
 	// Thực hiện tìm kiếm

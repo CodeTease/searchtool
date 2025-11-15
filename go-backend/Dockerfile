@@ -9,14 +9,12 @@ WORKDIR /app
 COPY go.mod .
 COPY go.sum .
 
-# 2. Tải dependencies dựa trên file go.sum
-# The --build-arg CACHE_BUSTER is used to ensure this layer is always run
-ARG CACHE_BUSTER=1
-RUN go mod download
-
-# 3. Copy toàn bộ mã nguồn còn lại
-# (main.go, static/, v.v.)
+# 2. Copy source code
 COPY . .
+
+# 3. Tidy dependencies
+# This ensures go.mod and go.sum are in sync with the code
+RUN go mod tidy
 
 # 4. Build Go binary
 # Bây giờ, tất cả dependencies đã có sẵn
