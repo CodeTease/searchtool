@@ -9,8 +9,9 @@ WORKDIR /app
 COPY go.mod .
 COPY go.sum .  
 
-# 2. Tải dependencies dựa trên file go.sum
-RUN go mod download
+# 2. Tidy and Vendor dependencies
+RUN go mod tidy
+RUN go mod vendor
 
 # 3. Copy toàn bộ mã nguồn còn lại
 # (main.go, static/, v.v.)
@@ -18,7 +19,7 @@ COPY . .
 
 # 4. Build Go binary
 # Bây giờ, tất cả dependencies đã có sẵn
-RUN CGO_ENABLED=0 go build -ldflags "-s -w" -o /app/main .
+RUN CGO_ENABLED=0 go build -mod=vendor -ldflags "-s -w" -o /app/main .
 
 # --- STAGE 2: Final (Môi trường chạy) ---
 FROM alpine:latest
