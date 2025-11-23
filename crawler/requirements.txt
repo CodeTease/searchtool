@@ -9,3 +9,4 @@ fasttext-wheel
 lxml
 aiodns
 numpy==1.24.4
+redis

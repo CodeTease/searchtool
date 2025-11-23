@@ -171,6 +171,17 @@ services:
     networks:
       - teaser_net
 
+  # JS Renderer (Node.js + Playwright)
+  js_renderer:
+    build:
+      context: ./js-renderer
+      dockerfile: Dockerfile
+    restart: on-failure
+    ports:
+      - "8888:8888"
+    networks:
+      - teaser_net
+
 # --- 3. VOLUMES và NETWORKS ---
 volumes:
   postgres_data:

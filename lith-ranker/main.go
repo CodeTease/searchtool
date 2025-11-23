@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"math"
 	"os"
 	"strconv"
 	"time"
@@ -22,12 +23,16 @@ const (
 // Page đại diện cho một trang web trong đồ thị
 // Optimized: Uses int64 ID instead of string URL to save RAM
 type Page struct {
-	ID       int64
-	URL      string // Still keep URL for reference if needed, but not as map key
-	LinksOut int    // Số lượng link đi ra
-	Score    float64
-	NewScore float64
-	LinksIn  []int64 // List of IDs pointing to this page (replacing map[string]struct{})
+	ID         int64
+	URL        string // Still keep URL for reference if needed, but not as map key
+	LinksOut   int    // Số lượng link đi ra
+	Score      float64
+	NewScore   float64
+	LinksIn        []int64 // List of IDs pointing to this page (replacing map[string]struct{})
+	TextLength     int
+	CrawledAt      time.Time
+	FreshnessScore float64
+	QualityScore   float64
 }
 
 func main() {
@@ -134,6 +139,29 @@ func calculateLithRank(ctx context.Context, pool *pgxpool.Pool, maxIter int) err
 		}
 	}
 
+	// Calculate Composite Score (Freshness + DepthIndex)
+	now := time.Now()
+	for _, p := range pages {
+		// Freshness: max(0, 1 - AgeInDays/365)
+		ageHours := now.Sub(p.CrawledAt).Hours()
+		ageDays := ageHours / 24.0
+		freshness := math.Max(0, 1.0-(ageDays/365.0))
+
+		// DepthIndex: log10(TextLength)
+		depthIndex := 0.0
+		if p.TextLength > 0 {
+			depthIndex = math.Log10(float64(p.TextLength))
+		}
+
+		// Store component scores for diagnostics
+		p.FreshnessScore = freshness
+		p.QualityScore = depthIndex
+
+		// Composite Formula
+		// NewLithScore = (PageRank * 0.8) + (Freshness * 0.1) + (DepthIndex * 0.1)
+		p.Score = (p.Score * 0.8) + (freshness * 0.1) + (depthIndex * 0.1)
+	}
+
 	// B4: Lưu kết quả xuống DB (Optimized with Temp Table)
 	return saveScores(ctx, pool, pages)
 }
@@ -144,7 +172,7 @@ func loadGraph(ctx context.Context, pool *pgxpool.Pool) (map[int64]*Page, error)
 
 	// Lấy danh sách các trang (Nodes)
 	// Fetch ID as well
-	rows, err := pool.Query(ctx, "SELECT id, url FROM crawled_pages")
+	rows, err := pool.Query(ctx, "SELECT id, url, COALESCE(text_length, 0), COALESCE(crawled_at, CURRENT_TIMESTAMP) FROM crawled_pages")
 	if err != nil {
 		return nil, err
 	}
@@ -153,11 +181,16 @@ func loadGraph(ctx context.Context, pool *pgxpool.Pool) (map[int64]*Page, error)
 	for rows.Next() {
 		var id int64
 		var url string
-		if err := rows.Scan(&id, &url); err == nil {
+		var textLength int
+		var crawledAt time.Time
+
+		if err := rows.Scan(&id, &url, &textLength, &crawledAt); err == nil {
 			pages[id] = &Page{
-				ID:      id,
-				URL:     url,
-				LinksIn: []int64{},
+				ID:         id,
+				URL:        url,
+				LinksIn:    []int64{},
+				TextLength: textLength,
+				CrawledAt:  crawledAt,
 			}
 			urlToID[url] = id
 		}
@@ -200,8 +233,8 @@ func saveScores(ctx context.Context, pool *pgxpool.Pool, pages map[int64]*Page) 
 	}
 	defer tx.Rollback(ctx)
 
-	// Create a temporary table
-	_, err = tx.Exec(ctx, "CREATE TEMP TABLE lith_scores_temp (id BIGINT, score FLOAT) ON COMMIT DROP")
+	// Create a temporary table with diagnostic columns
+	_, err = tx.Exec(ctx, "CREATE TEMP TABLE lith_scores_temp (id BIGINT, score FLOAT, freshness FLOAT, quality FLOAT) ON COMMIT DROP")
 	if err != nil {
 		return fmt.Errorf("creating temp table: %w", err)
 	}
@@ -209,14 +242,14 @@ func saveScores(ctx context.Context, pool *pgxpool.Pool, pages map[int64]*Page) 
 	// Prepare data for COPY
 	rows := [][]interface{}{}
 	for _, p := range pages {
-		rows = append(rows, []interface{}{p.ID, p.Score})
+		rows = append(rows, []interface{}{p.ID, p.Score, p.FreshnessScore, p.QualityScore})
 	}
 
 	// Bulk Insert into Temp Table using COPY
 	count, err := tx.CopyFrom(
 		ctx,
 		pgx.Identifier{"lith_scores_temp"},
-		[]string{"id", "score"},
+		[]string{"id", "score", "freshness", "quality"},
 		pgx.CopyFromRows(rows),
 	)
 	if err != nil {
@@ -228,7 +261,9 @@ func saveScores(ctx context.Context, pool *pgxpool.Pool, pages map[int64]*Page) 
 	// Using FROM clause to update efficiently
 	updateQuery := `
 		UPDATE crawled_pages
-		SET lith_score = t.score
+		SET lith_score = t.score,
+		    freshness_score = t.freshness,
+		    quality_score = t.quality
 		FROM lith_scores_temp t
 		WHERE crawled_pages.id = t.id
 	`

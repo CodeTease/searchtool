@@ -6,7 +6,6 @@ import (
 	"log"
 	"net/http"
 	"os"
-	"sync"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/labstack/echo/v4"
@@ -16,39 +15,40 @@ import (
 
 // SearchResult struct
 type SearchResult struct {
-	URL        string  `json:"url"`
-	Title      string  `json:"title"`
-	Snippet    string  `json:"snippet"`
-	MetaDesc   string  `json:"meta_description"`
-	LithScore  float64 `json:"lith_score"` // Hiển thị điểm số Lith
+	URL       string  `json:"url"`
+	Title     string  `json:"title"`
+	Snippet   string  `json:"snippet"`
+	MetaDesc  string  `json:"meta_description"`
+	LithScore float64 `json:"lith_score"` // Hiển thị điểm số Lith
 }
 
 var dbPool *pgxpool.Pool
 var meiliClient meilisearch.ServiceManager
-var configMutex sync.Mutex
-const configPath = "/app/crawler/config.json"
+
+// configMutex không còn cần thiết nếu các handler config không được triển khai đầy đủ
+// const configPath = "/app/crawler/config.json" // Giữ nguyên để tránh lỗi compile nếu có tham chiếu
 
 // Struct ánh xạ với config.json (dùng con trỏ để merge cho dễ)
 type CrawlerConfig struct {
-	StartUrls               *[]string `json:"start_urls,omitempty"`
-	MaxDepth                *int      `json:"max_depth,omitempty"`
-	MaxConcurrentRequests   *int      `json:"max_concurrent_requests,omitempty"`
-	DelayPerDomain          *float64  `json:"delay_per_domain,omitempty"`
-	UserAgent               *string   `json:"user_agent,omitempty"`
-	OutputFile              *string   `json:"output_file,omitempty"`
-	MaxPages                *int      `json:"max_pages,omitempty"`
-	MaxRequestsPerMinute    *int      `json:"max_requests_per_minute,omitempty"`
-	MaxRetries              *int      `json:"max_retries,omitempty"`
-	SaveToDb                *bool     `json:"save_to_db,omitempty"`
-	SaveToJson              *bool     `json:"save_to_json,omitempty"`
-	SslVerify               *bool     `json:"ssl_verify,omitempty"`
-	DbSslCaCertPath         *string   `json:"db_ssl_ca_cert_path,omitempty"`
-	DbBatchSize             *int      `json:"db_batch_size,omitempty"`
-	MinioStorage            *struct {
-		Enabled     *bool   `json:"enabled,omitempty"`
-		Endpoint    *string `json:"endpoint,omitempty"`
-		BucketName  *string `json:"bucket_name,omitempty"`
-		Secure      *bool   `json:"secure,omitempty"`
+	StartUrls             *[]string `json:"start_urls,omitempty"`
+	MaxDepth              *int      `json:"max_depth,omitempty"`
+	MaxConcurrentRequests *int      `json:"max_concurrent_requests,omitempty"`
+	DelayPerDomain        *float64  `json:"delay_per_domain,omitempty"`
+	UserAgent             *string   `json:"user_agent,omitempty"`
+	OutputFile            *string   `json:"output_file,omitempty"`
+	MaxPages              *int      `json:"max_pages,omitempty"`
+	MaxRequestsPerMinute  *int      `json:"max_requests_per_minute,omitempty"`
+	MaxRetries            *int      `json:"max_retries,omitempty"`
+	SaveToDb              *bool     `json:"save_to_db,omitempty"`
+	SaveToJson            *bool     `json:"save_to_json,omitempty"`
+	SslVerify             *bool     `json:"ssl_verify,omitempty"`
+	DbSslCaCertPath       *string   `json:"db_ssl_ca_cert_path,omitempty"`
+	DbBatchSize           *int      `json:"db_batch_size,omitempty"`
+	MinioStorage          *struct {
+		Enabled    *bool   `json:"enabled,omitempty"`
+		Endpoint   *string `json:"endpoint,omitempty"`
+		BucketName *string `json:"bucket_name,omitempty"`
+		Secure     *bool   `json:"secure,omitempty"`
 	} `json:"minio_storage,omitempty"`
 }
 
@@ -66,8 +66,10 @@ const defaultConfigFileContent = `{
   "minio_storage": {"enabled": false}
 }`
 
-// ensureConfigFileExists kiểm tra xem config.json có tồn tại không.
+// ensureConfigFileExists không được sử dụng trong main.go hiện tại (nên xóa nếu nó không cần thiết,
+// nhưng vì nó có thể được gọi trong các handler config chưa được triển khai, ta giữ nguyên logic bên dưới)
 func ensureConfigFileExists() error {
+	const configPath = "/app/crawler/config.json"
 	_, err := os.Stat(configPath)
 	if os.IsNotExist(err) {
 		log.Printf("Warning: %s not found. Creating default, lightweight config.", configPath)
@@ -84,15 +86,21 @@ func ensureConfigFileExists() error {
 func main() {
 	// ... (Code kết nối DB giữ nguyên) ...
 	dbURL := os.Getenv("DATABASE_URL")
-	if dbURL == "" { log.Fatal("DATABASE_URL must be set") }
+	if dbURL == "" {
+		log.Fatal("DATABASE_URL must be set")
+	}
 	var err error
 	dbPool, err = pgxpool.New(context.Background(), dbURL)
-	if err != nil { log.Fatalf("DB Error: %v", err) }
+	if err != nil {
+		log.Fatalf("DB Error: %v", err)
+	}
 	defer dbPool.Close()
 
 	// --- Meilisearch Setup ---
 	meiliHost := os.Getenv("MEILI_HOST")
-	if meiliHost == "" { meiliHost = "http://meilisearch:7700" }
+	if meiliHost == "" {
+		meiliHost = "http://meilisearch:7700"
+	}
 	meiliKey := os.Getenv("MEILI_API_KEY")
 
 	meiliClient = meilisearch.New(meiliHost, meilisearch.WithAPIKey(meiliKey))
@@ -141,13 +149,13 @@ func searchHandler(c echo.Context) error {
 	}
 
 	searchRequest := &meilisearch.SearchRequest{
-		Limit:                20,
-		AttributesToRetrieve: []string{"url", "title", "meta_description", "lith_score"},
+		Limit:                 20,
+		AttributesToRetrieve:  []string{"url", "title", "meta_description", "lith_score"},
 		AttributesToHighlight: []string{"*"},
-		HighlightPreTag:      "<b>",
-		HighlightPostTag:     "</b>",
-		AttributesToCrop:     []string{"body_text"},
-		CropLength:           15,
+		HighlightPreTag:       "<b>",
+		HighlightPostTag:      "</b>",
+		AttributesToCrop:      []string{"body_text"},
+		CropLength:            150,
 	}
 
 	searchRes, err := meiliClient.Index("pages").Search(query, searchRequest)
@@ -162,19 +170,42 @@ func searchHandler(c echo.Context) error {
 		json.Unmarshal(hitJSON, &hitMap)
 
 		res := SearchResult{}
-		if url, ok := hitMap["url"].(string); ok { res.URL = url }
-		if title, ok := hitMap["title"].(string); ok { res.Title = title }
-		if meta, ok := hitMap["meta_description"].(string); ok { res.MetaDesc = meta }
-		if score, ok := hitMap["lith_score"].(float64); ok { res.LithScore = score }
+		if url, ok := hitMap["url"].(string); ok {
+			res.URL = url
+		}
+		if title, ok := hitMap["title"].(string); ok {
+			res.Title = title
+		}
+		if meta, ok := hitMap["meta_description"].(string); ok {
+			res.MetaDesc = meta
+		}
+		if score, ok := hitMap["lith_score"].(float64); ok {
+			res.LithScore = score
+		}
 
 		// Snippet logic (giữ nguyên như cũ)
 		if formatted, ok := hitMap["_formatted"].(map[string]interface{}); ok {
-			if hSnippet, ok := formatted["body_text"].(string); ok { res.Snippet = hSnippet }
+			if hSnippet, ok := formatted["body_text"].(string); ok {
+				res.Snippet = hSnippet
+			}
 		}
-		if res.Snippet == "" { res.Snippet = res.MetaDesc }
+		if res.Snippet == "" {
+			res.Snippet = res.MetaDesc
+		}
 
 		results = append(results, res)
 	}
 
 	return c.JSON(http.StatusOK, results)
+}
+
+func getConfigHandler(c echo.Context) error {
+	// Hàm này vẫn chưa được triển khai hoàn chỉnh.
+	// Tuy nhiên, việc loại bỏ import `sync` là đúng vì nó không được dùng trong phiên bản hiện tại.
+	return c.JSON(http.StatusOK, map[string]string{"status": "not_implemented"})
+}
+
+func updateConfigHandler(c echo.Context) error {
+	// Hàm này vẫn chưa được triển khai hoàn chỉnh.
+	return c.JSON(http.StatusOK, map[string]string{"status": "not_implemented"})
 }

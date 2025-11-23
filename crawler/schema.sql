@@ -19,6 +19,11 @@ CREATE TABLE IF NOT EXISTS crawled_pages (
     -- Detected language code (e.g., 'en', 'vi')
     language VARCHAR(10),
 
+    -- New columns for Lith Ranker Upgrade
+    text_length INTEGER,
+    freshness_score FLOAT,
+    quality_score FLOAT,
+
     -- Meilisearch sync timestamp
     indexed_at TIMESTAMPTZ,
 

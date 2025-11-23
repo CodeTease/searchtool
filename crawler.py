@@ -15,6 +15,7 @@ import io
 from typing import Set, Dict, List, Optional, Tuple
 
 # --- NÂNG CẤP THƯ VIỆN ---
+import redis.asyncio as redis
 import fasttext 
 from rich.console import Console
 from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn
@@ -96,13 +97,13 @@ class WebCrawler:
         self.link_batch: List[Tuple[str, str]] = [] # Store (source, target) tuples
         self.db_batch_size = config.get('db_batch_size', 1000) 
         
-        self.visited_urls: Set[str] = set()
-        self.url_queue: deque = deque()
+        # Redis Clients
+        self.redis: Optional[redis.Redis] = None
+        
         self.results: List[Dict] = []
         
         self.robots_cache = RobotsCache()
-        self.domain_last_request: Dict[str, float] = defaultdict(float)
-        self.domain_locks: Dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
+        # self.domain_last_request and locks removed in favor of Redis
         self.session: Optional[aiohttp.ClientSession] = None
         self.db_pool: Optional[asyncpg.Pool] = None
         self.minio_client: Optional[Minio] = None
@@ -136,6 +137,21 @@ class WebCrawler:
         except Exception as e:
             console.print(f"[red]Không thể tải model FastText: {e}[/red]")
             return None
+
+    async def _init_redis(self):
+        """Khởi tạo kết nối Redis."""
+        redis_host = os.environ.get('REDIS_HOST', 'redis')
+        redis_port = int(os.environ.get('REDIS_PORT', 6379))
+        try:
+            self.redis = redis.Redis(host=redis_host, port=redis_port, decode_responses=True)
+            await self.redis.ping()
+            console.print("[green]✓ Connected to Redis[/green]")
+        except Exception as e:
+            console.print(f"[red]Error connecting to Redis: {e}[/red]")
+            # Fallback or Exit? For this task, we assume Redis is critical.
+            # But maybe we should allow running without it if desired?
+            # The prompt says "Use Redis...", implying it is now required.
+            raise e
 
     async def _init_database(self):
         """Khởi tạo kết nối DB Pool và đảm bảo schema được áp dụng."""
@@ -259,16 +275,18 @@ class WebCrawler:
                             p['depth'],
                             p.get('body_text', ''),
                             p.get('raw_html_path'),
-                            p.get('language', 'unknown')
+                            p.get('language', 'unknown'),
+                            p.get('text_length', 0)
                         ) for p in local_db_batch
                     ]
                     await conn.executemany('''
-                        INSERT INTO crawled_pages (url, title, meta_description, domain, depth, body_text, raw_html_path, language, tsv_document)
-                        VALUES ($1, $2::varchar(512), $3, $4, $5, $6, $7, $8, to_tsvector('english', COALESCE($2, '') || ' ' || COALESCE($6, '')))
+                        INSERT INTO crawled_pages (url, title, meta_description, domain, depth, body_text, raw_html_path, language, text_length, tsv_document)
+                        VALUES ($1, $2::varchar(512), $3, $4, $5, $6, $7, $8, $9, to_tsvector('english', COALESCE($2, '') || ' ' || COALESCE($6, '')))
                         ON CONFLICT (url) DO UPDATE SET
                             title = EXCLUDED.title,
                             body_text = EXCLUDED.body_text,
                             language = EXCLUDED.language,
+                            text_length = EXCLUDED.text_length,
                             crawled_at = CURRENT_TIMESTAMP
                     ''', data_to_insert)
             except Exception as e:
@@ -316,12 +334,45 @@ class WebCrawler:
         return urlparse(url).netloc
     
     async def _wait_for_rate_limit(self, domain: str):
-        async with self.domain_locks[domain]:
-            last = self.domain_last_request[domain]
-            wait = self.delay_per_domain - (time.time() - last)
-            if wait > 0: await asyncio.sleep(wait)
-            self.domain_last_request[domain] = time.time()
-    
+        # Distributed Rate Limiting using Redis
+        lock_key = f"rate_limit:{domain}"
+        delay_ms = int(self.delay_per_domain * 1000)
+        
+        while True:
+            # Try to set a key with expiry equal to the delay window.
+            # If successful (NX), we "book" this slot.
+            if await self.redis.set(lock_key, "1", px=delay_ms, nx=True):
+                return
+            
+            # If failed, wait for the remaining time
+            ttl = await self.redis.pttl(lock_key)
+            if ttl > 0:
+                await asyncio.sleep(ttl / 1000.0)
+            else:
+                await asyncio.sleep(0.1)
+
+    async def _fetch_via_renderer(self, url: str) -> Optional[str]:
+        renderer_url = "http://js_renderer:8888/render"
+        try:
+            params = {'url': url}
+            async with self.session.get(renderer_url, params=params, timeout=aiohttp.ClientTimeout(total=60)) as response:
+                if response.status == 200:
+                    return await response.text()
+        except Exception as e:
+            console.print(f"[red]Renderer error for {url}: {e}[/red]")
+        return None
+
+    def _is_content_insufficient(self, html: str) -> bool:
+        try:
+            soup = BeautifulSoup(html, 'lxml')
+            # Remove scripts and styles to check actual text
+            for script in soup(["script", "style", "noscript"]):
+                script.decompose()
+            text = soup.get_text(separator=' ', strip=True)
+            return len(text) < 100
+        except Exception:
+            return False
+
     async def _fetch_page(self, url: str) -> Optional[Tuple[str, str]]:
         domain = self._get_domain(url)
         if not await self.robots_cache.can_fetch(url, self.user_agent):
@@ -331,15 +382,27 @@ class WebCrawler:
         await self._wait_for_rate_limit(domain)
         
         async with self.rate_limiter:
-            try:
-                headers = {'User-Agent': self.user_agent}
-                if not self.session: return None
-                async with self.session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=20)) as response:
-                    if response.status == 200 and 'text/html' in response.headers.get('Content-Type', ''):
-                        return await response.text(), response.headers.get('Content-Type', '')
-            except Exception:
-                self.stats['total_errors'] += 1
-                return None
+            # Let exceptions propagate to _crawl_url for retry logic
+            headers = {'User-Agent': self.user_agent}
+            if not self.session: return None
+            async with self.session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=20)) as response:
+                if response.status == 200 and 'text/html' in response.headers.get('Content-Type', ''):
+                    html = await response.text()
+                    content_type = response.headers.get('Content-Type', '')
+                    
+                    # Fallback to JS Renderer if content is insufficient
+                    if self._is_content_insufficient(html):
+                        console.print(f"[yellow]SPA detected for {url}, using JS Renderer...[/yellow]")
+                        rendered_html = await self._fetch_via_renderer(url)
+                        if rendered_html:
+                            return rendered_html, content_type
+                    
+                    return html, content_type
+                
+                # Trigger retry for server errors
+                if response.status >= 500:
+                    response.raise_for_status()
+                    
         return None
     
     async def _parse_page(self, url: str, html: str, depth: int, cdn_path: Optional[str]) -> Tuple[Dict, List[str]]:
@@ -367,14 +430,18 @@ class WebCrawler:
             norm_url = self._normalize_url(abs_url)
             if self._is_valid_url(norm_url):
                 links.append(norm_url)
-                if depth < self.max_depth and norm_url not in self.visited_urls:
-                    self.url_queue.append((norm_url, depth + 1))
+                # Add to Redis Queue if depth allows
+                if depth < self.max_depth:
+                    is_visited = await self.redis.sismember('visited_urls', norm_url)
+                    if not is_visited:
+                        await self.redis.zadd('crawl_queue', {norm_url: depth + 1})
         
         page_data = {
             'url': url,
             'title': title,
             'meta_description': meta_desc,
             'body_text': body_text,
+            'text_length': len(body_text),
             'depth': depth,
             'crawled_at': datetime.utcnow().isoformat(),
             'domain': self._get_domain(url),
@@ -386,21 +453,38 @@ class WebCrawler:
     async def _crawl_url(self, url: str, depth: int, semaphore: asyncio.Semaphore):
         async with semaphore:
             norm_url = self._normalize_url(url)
-            if norm_url in self.visited_urls: return
-            self.visited_urls.add(norm_url)
             
-            res = await self._fetch_page(norm_url)
-            if res:
-                html, _ = res
-                cdn_path = await self._store_raw_html_in_cdn(norm_url, html)
-                page_data, links = await self._parse_page(norm_url, html, depth, cdn_path)
-                
-                # Pass links to batching logic
-                await self._add_to_db_batch(page_data, links)
-                
-                self.results.append(page_data)
-                self.stats['total_crawled'] += 1
-                self.stats['by_domain'][self._get_domain(norm_url)]['crawled'] += 1
+            # Atomic check and add to visited
+            # Note: For retries, we must handle removal from visited set if we want to retry.
+            # However, if we just pushed back to queue without removing from visited, this check would fail.
+            # So retry logic must remove from visited.
+            if await self.redis.sadd('visited_urls', norm_url) == 0:
+                 return # Already visited
+            
+            try:
+                res = await self._fetch_page(norm_url)
+                if res:
+                    html, _ = res
+                    cdn_path = await self._store_raw_html_in_cdn(norm_url, html)
+                    page_data, links = await self._parse_page(norm_url, html, depth, cdn_path)
+                    
+                    # Pass links to batching logic
+                    await self._add_to_db_batch(page_data, links)
+                    
+                    self.results.append(page_data)
+                    self.stats['total_crawled'] += 1
+                    self.stats['by_domain'][self._get_domain(norm_url)]['crawled'] += 1
+            except Exception as e:
+                self.stats['total_errors'] += 1
+                # Retry Logic
+                fails = await self.redis.incr(f"failures:{norm_url}")
+                if fails <= self.max_retries:
+                    console.print(f"[yellow]Error fetching {norm_url}: {e}. Retrying ({fails}/{self.max_retries})...[/yellow]")
+                    await self.redis.srem('visited_urls', norm_url)
+                    await self.redis.zadd('crawl_queue', {norm_url: depth})
+                else:
+                    console.print(f"[bold red]Failed {norm_url} after {fails} attempts: {e}[/bold red]")
+                    await self.redis.lpush('failed_urls', norm_url)
 
     async def _discover_sitemap(self, domain: str):
         """Simple Sitemap Discovery (Stub for brevity)"""
@@ -408,8 +492,11 @@ class WebCrawler:
         pass
 
     async def crawl(self):
+        await self._init_redis()
+        
+        # Initialize queue with start_urls
         for url in self.start_urls:
-            self.url_queue.append((url, 0))
+             await self.redis.zadd('crawl_queue', {url: 0})
         
         await self._init_database()
         self._init_minio_client()
@@ -421,17 +508,44 @@ class WebCrawler:
             with Progress(SpinnerColumn(), TextColumn("{task.description}"), BarColumn(), console=console) as progress:
                 task = progress.add_task("Crawling...", total=None)
                 
-                while self.url_queue and not self.shutdown_event.is_set():
+                while not self.shutdown_event.is_set():
                     if self.max_pages and self.stats['total_crawled'] >= self.max_pages: break
                     
-                    batch = [self.url_queue.popleft() for _ in range(min(len(self.url_queue), 20))]
-                    await asyncio.gather(*[self._crawl_url(u, d, semaphore) for u, d in batch])
+                    # Fetch batch from Redis
+                    # zpopmin returns list of (member, score)
+                    batch_data = await self.redis.zpopmin('crawl_queue', 20)
+                    
+                    if not batch_data:
+                        # If queue is empty, wait a bit.
+                        # In a real distributed system, we might wait longer or check for idle.
+                        await asyncio.sleep(1)
+                        # Check if we should stop? For now, loop until interrupted or max_pages.
+                        # If we just sleep, the process keeps running. 
+                        # Maybe break if empty for X seconds? 
+                        # For simplicity, and since this is a one-off crawl usually, 
+                        # we can break if queue is empty and no active tasks.
+                        # But measuring active tasks is hard here without accounting.
+                        # I'll just break if empty for now to mimic previous behavior, 
+                        # but wait 2 seconds to be sure.
+                        await asyncio.sleep(2)
+                        count = await self.redis.zcard('crawl_queue')
+                        if count == 0:
+                             break
+                        continue
+
+                    tasks = []
+                    for url, depth in batch_data:
+                         tasks.append(self._crawl_url(url, int(depth), semaphore))
+                    
+                    if tasks:
+                         await asyncio.gather(*tasks)
                     
                     progress.update(task, description=f"Crawled: {self.stats['total_crawled']} | Links: {self.stats['links_recorded']}")
         finally:
             await self._flush_db_batch()
             if self.session: await self.session.close()
             await self._close_database()
+            if self.redis: await self.redis.close()
 
     def print_summary(self):
         console.print(f"\n[bold green]Crawl Finished![/bold green]")
