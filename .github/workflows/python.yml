@@ -3,19 +3,30 @@ name: Python Services
 on:
   push:
     branches: [ "main", "master" ]
-    paths:
-      - 'crawler/**'
-      - 'indexer/**'
-      - '*.py'
   pull_request:
     branches: [ "main", "master" ]
-    paths:
-      - 'crawler/**'
-      - 'indexer/**'
-      - '*.py'
 
 jobs:
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      crawler: ${{ steps.filter.outputs.crawler }}
+      indexer: ${{ steps.filter.outputs.indexer }}
+    steps:
+    - uses: actions/checkout@v4
+    - uses: dorny/paths-filter@v3
+      id: filter
+      with:
+        filters: |
+          crawler:
+            - 'crawler/**'
+            - '*.py'
+          indexer:
+            - 'indexer/**'
+
   lint-crawler:
+    needs: changes
+    if: ${{ needs.changes.outputs.crawler == 'true' }}
     name: Lint Crawler
     runs-on: ubuntu-latest
     defaults:
@@ -37,12 +48,12 @@ jobs:
 
     - name: Lint with flake8
       run: |
-        # stop the build if there are Python syntax errors or undefined names
         flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics
-        # exit-zero treats all errors as warnings. The GitHub editor is 127 chars wide
         flake8 . --count --exit-zero --max-complexity=10 --max-line-length=127 --statistics
 
   lint-indexer:
+    needs: changes
+    if: ${{ needs.changes.outputs.indexer == 'true' }}
     name: Lint Indexer
     runs-on: ubuntu-latest
     defaults:

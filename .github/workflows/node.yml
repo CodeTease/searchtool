@@ -3,17 +3,29 @@ name: Node.js Services
 on:
   push:
     branches: [ "main", "master" ]
-    paths:
-      - 'dashboard-frontend/**'
-      - 'js-renderer/**'
   pull_request:
     branches: [ "main", "master" ]
-    paths:
-      - 'dashboard-frontend/**'
-      - 'js-renderer/**'
 
 jobs:
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      dashboard: ${{ steps.filter.outputs.dashboard }}
+      renderer: ${{ steps.filter.outputs.renderer }}
+    steps:
+    - uses: actions/checkout@v4
+    - uses: dorny/paths-filter@v3
+      id: filter
+      with:
+        filters: |
+          dashboard:
+            - 'dashboard-frontend/**'
+          renderer:
+            - 'js-renderer/**'
+
   build-dashboard:
+    needs: changes
+    if: ${{ needs.changes.outputs.dashboard == 'true' }}
     name: Build Dashboard Frontend
     runs-on: ubuntu-latest
     defaults:
@@ -25,7 +37,7 @@ jobs:
     - name: Set up Node.js
       uses: actions/setup-node@v4
       with:
-        node-version: '22'
+        node-version: '18'
         cache: 'npm'
         cache-dependency-path: dashboard-frontend/package-lock.json
 
@@ -34,13 +46,14 @@ jobs:
 
     - name: Lint
       run: npm run lint
-      # If lint script is missing, this might fail, but standard Next.js has it.
       continue-on-error: true
 
     - name: Build
       run: npm run build
 
   check-js-renderer:
+    needs: changes
+    if: ${{ needs.changes.outputs.renderer == 'true' }}
     name: Check JS Renderer
     runs-on: ubuntu-latest
     defaults:
@@ -53,10 +66,9 @@ jobs:
       uses: actions/setup-node@v4
       with:
         node-version: '18'
-        # cache: 'npm' # No lockfile in root usually for simple scripts, checking next step
 
     - name: Install dependencies
-      run: npm install # Using install instead of ci as lockfile might be missing or out of sync in dev envs
+      run: npm install
     
     - name: Syntax Check
       run: node --check server.js

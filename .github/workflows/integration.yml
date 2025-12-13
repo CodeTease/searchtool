@@ -9,6 +9,7 @@ on:
 jobs:
   fast-build-check:
     runs-on: ubuntu-latest
+    environment: integration # Required reviewers
     
     # Tạo một file .env giả để các service không bị lỗi thiếu biến môi trường
     env:
@@ -35,7 +36,7 @@ jobs:
       - name: Build and Start All Services
         run: |
           # Dùng --force-recreate để đảm bảo tất cả được dựng mới
-          docker-compose -f docker-compose.yml up -d --build --force-recreate
+          docker compose -f docker-compose.yml up -d --build --force-recreate
       
       # BƯỚC 2: Kiểm tra nhanh (Quick Health Check)
       # Chúng ta không cần đợi Full Integration. Chỉ cần đợi 30 giây
@@ -48,11 +49,11 @@ jobs:
         # Lệnh này sẽ kiểm tra xem có service nào bị lỗi (Exited) hay không.
         # Nếu có service nào bị crash (Exited > 0), lệnh này sẽ fail job.
         run: |
-          docker-compose ps
+          docker compose ps
           # Kiểm tra xem có container nào bị thoát ra không (Exited)
-          if docker-compose ps --filter "state=exited" | grep -q "Exited ("; then
+          if docker compose ps --filter "status=exited" | grep -q "Exited"; then
             echo "ERROR: One or more services failed to start!"
-            docker-compose logs
+            docker compose logs
             exit 1
           fi
 
@@ -60,4 +61,4 @@ jobs:
       # Tắt và xóa tất cả container, networks, và volumes (data cache)
       - name: Cleanup Containers
         if: always() # Luôn chạy, kể cả khi bước trên fail
-        run: docker-compose -f docker-compose.yml down -v --rmi all
+        run: docker compose -f docker-compose.yml down -v --rmi all
