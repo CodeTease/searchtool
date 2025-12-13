@@ -7,3 +7,6 @@ lith-ranker/lith-ranker
 *.vegh 
 .veghcache
 .veghhooks.json
+
+# Node
+node_modules/

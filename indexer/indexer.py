@@ -64,10 +64,9 @@ async def main():
     while True:
         try:
             async with db_pool.acquire() as connection:
-                # Lấy thêm lith_score từ DB
-                # Truncate body_text to 100KB to avoid memory/network issues
+                
                 query = f"""
-                    SELECT id, url, title, meta_description, LEFT(body_text, 100000) as body_text, domain, language, crawled_at, lith_score
+                    SELECT id, url, title, meta_description, domain, language, crawled_at, lith_score
                     FROM crawled_pages
                     WHERE indexed_at IS NULL OR crawled_at > indexed_at
                     LIMIT {BATCH_SIZE};

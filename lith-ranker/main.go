@@ -20,19 +20,54 @@ const (
 	DefaultInterval      = 60   // Phút (Mặc định tính lại mỗi tiếng)
 )
 
-// Page đại diện cho một trang web trong đồ thị
-// Optimized: Uses int64 ID instead of string URL to save RAM
-type Page struct {
-	ID             int64
-	URL            string // Still keep URL for reference if needed, but not as map key
-	LinksOut       int    // Số lượng link đi ra
-	Score          float64
-	NewScore       float64
-	LinksIn        []int64 // List of IDs pointing to this page (replacing map[string]struct{})
-	TextLength     int
-	CrawledAt      time.Time
-	FreshnessScore float64
-	QualityScore   float64
+// CompactGraph optimizes memory usage using parallel arrays (Struct of Arrays)
+// instead of map[int64]*Page, and using int32 indices for links.
+type CompactGraph struct {
+	// Node data
+	IDs            []int64
+	Scores         []float64
+	NewScores      []float64
+	LinksOut       []int32
+	TextLengths    []int32
+	CrawledAts     []int64 // Unix timestamp
+	Freshness      []float64
+	Quality        []float64
+
+	// Graph structure (Adjacency List using local indices)
+	// LinksIn[i] contains the list of *indices* (not IDs) that point to node i.
+	LinksIn        [][]int32
+
+	// Map ID to Index (only used during loading, cleared after)
+	idToIndex map[int64]int32
+}
+
+func NewCompactGraph(capacity int) *CompactGraph {
+	return &CompactGraph{
+		IDs:         make([]int64, 0, capacity),
+		Scores:      make([]float64, 0, capacity),
+		NewScores:   make([]float64, 0, capacity),
+		LinksOut:    make([]int32, 0, capacity),
+		TextLengths: make([]int32, 0, capacity),
+		CrawledAts:  make([]int64, 0, capacity),
+		Freshness:   make([]float64, 0, capacity),
+		Quality:     make([]float64, 0, capacity),
+		LinksIn:     make([][]int32, 0, capacity),
+		idToIndex:   make(map[int64]int32, capacity),
+	}
+}
+
+func (g *CompactGraph) AddNode(id int64, textLength int, crawledAt time.Time) {
+	idx := int32(len(g.IDs))
+	g.IDs = append(g.IDs, id)
+	g.Scores = append(g.Scores, 0.0)
+	g.NewScores = append(g.NewScores, 0.0)
+	g.LinksOut = append(g.LinksOut, 0)
+	g.TextLengths = append(g.TextLengths, int32(textLength))
+	g.CrawledAts = append(g.CrawledAts, crawledAt.Unix())
+	g.Freshness = append(g.Freshness, 0.0)
+	g.Quality = append(g.Quality, 0.0)
+	g.LinksIn = append(g.LinksIn, []int32{}) // Initialize empty slice
+	g.idToIndex[id] = idx
 }
 
 func main() {
@@ -86,7 +121,7 @@ func runLithCycle(pool *pgxpool.Pool, maxIter int) {
 	log.Println("--- Starting Lith Rank Calculation Cycle ---")
 	start := time.Now()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Minute) // Increased timeout for heavy tasks
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Minute)
 	defer cancel()
 
 	if err := calculateLithRank(ctx, pool, maxIter); err != nil {
@@ -100,12 +135,12 @@ func runLithCycle(pool *pgxpool.Pool, maxIter int) {
 // calculateLithRank thực hiện thuật toán PageRank
 func calculateLithRank(ctx context.Context, pool *pgxpool.Pool, maxIter int) error {
 	// B1: Tải đồ thị từ DB vào RAM (Optimized)
-	pages, err := loadGraph(ctx, pool)
+	graph, err := loadGraph(ctx, pool)
 	if err != nil {
 		return err
 	}
 
-	count := len(pages)
+	count := len(graph.IDs)
 	if count == 0 {
 		log.Println("Graph is empty. Nothing to rank.")
 		return nil
@@ -114,64 +149,69 @@ func calculateLithRank(ctx context.Context, pool *pgxpool.Pool, maxIter int) err
 
 	// B2: Khởi tạo điểm số ban đầu (1.0 / N)
 	initialScore := 1.0 / float64(count)
-	for _, p := range pages {
-		p.Score = initialScore
+	for i := 0; i < count; i++ {
+		graph.Scores[i] = initialScore
 	}
 
 	// B3: Lặp để tính toán (The core algorithm)
 	// Công thức: PR(A) = (1-d)/N + d * Sum(PR(B)/L(B))
 	baseScore := (1.0 - DampingFactor) / float64(count)
 
-	for i := 0; i < maxIter; i++ {
-		for _, p := range pages {
+	for iter := 0; iter < maxIter; iter++ {
+		for i := 0; i < count; i++ {
 			incomingScore := 0.0
-			for _, sourceID := range p.LinksIn {
-				if sourcePage, ok := pages[sourceID]; ok && sourcePage.LinksOut > 0 {
-					incomingScore += sourcePage.Score / float64(sourcePage.LinksOut)
+			// Iterate over indices of pages linking to i
+			for _, sourceIdx := range graph.LinksIn[i] {
+				// Access source page via index directly
+				if graph.LinksOut[sourceIdx] > 0 {
+					incomingScore += graph.Scores[sourceIdx] / float64(graph.LinksOut[sourceIdx])
 				}
 			}
-			p.NewScore = baseScore + (DampingFactor * incomingScore)
+			graph.NewScores[i] = baseScore + (DampingFactor * incomingScore)
 		}
 
-		// Cập nhật điểm cho vòng lặp sau
-		for _, p := range pages {
-			p.Score = p.NewScore
-		}
+		// Swap scores
+		copy(graph.Scores, graph.NewScores)
 	}
 
 	// Calculate Composite Score (Freshness + DepthIndex)
-	now := time.Now()
-	for _, p := range pages {
+	now := time.Now().Unix()
+	for i := 0; i < count; i++ {
 		// Freshness: max(0, 1 - AgeInDays/365)
-		ageHours := now.Sub(p.CrawledAt).Hours()
-		ageDays := ageHours / 24.0
+		ageSeconds := now - graph.CrawledAts[i]
+		ageDays := float64(ageSeconds) / (24.0 * 3600.0)
 		freshness := math.Max(0, 1.0-(ageDays/365.0))
 
 		// DepthIndex: log10(TextLength)
 		depthIndex := 0.0
-		if p.TextLength > 0 {
-			depthIndex = math.Log10(float64(p.TextLength))
+		if graph.TextLengths[i] > 0 {
+			depthIndex = math.Log10(float64(graph.TextLengths[i]))
 		}
 
-		// Store component scores for diagnostics
-		p.FreshnessScore = freshness
-		p.QualityScore = depthIndex
+		// Store component scores
+		graph.Freshness[i] = freshness
+		graph.Quality[i] = depthIndex
 
 		// Composite Formula
-		// NewLithScore = (PageRank * 0.8) + (Freshness * 0.1) + (DepthIndex * 0.1)
-		p.Score = (p.Score * 0.8) + (freshness * 0.1) + (depthIndex * 0.1)
+		graph.Scores[i] = (graph.Scores[i] * 0.8) + (freshness * 0.1) + (depthIndex * 0.1)
 	}
 
 	// B4: Lưu kết quả xuống DB (Optimized with Temp Table)
-	return saveScores(ctx, pool, pages)
+	return saveScores(ctx, pool, graph)
 }
 
-func loadGraph(ctx context.Context, pool *pgxpool.Pool) (map[int64]*Page, error) {
-	pages := make(map[int64]*Page)
-	// Removed urlToID map to save memory
+func loadGraph(ctx context.Context, pool *pgxpool.Pool) (*CompactGraph, error) {
+	// Estimate capacity
+	var count int
+	err := pool.QueryRow(ctx, "SELECT COUNT(*) FROM crawled_pages").Scan(&count)
+	if err != nil {
+		count = 10000 // Fallback
+	}
+
+	graph := NewCompactGraph(count)
 
 	// Lấy danh sách các trang (Nodes)
-	// Not fetching URL to save memory, only fetching strictly necessary fields
+	// Only fetch strictly necessary fields.
 	rows, err := pool.Query(ctx, "SELECT id, COALESCE(text_length, 0), COALESCE(crawled_at, CURRENT_TIMESTAMP) FROM crawled_pages")
 	if err != nil {
 		return nil, err
@@ -184,13 +224,7 @@ func loadGraph(ctx context.Context, pool *pgxpool.Pool) (map[int64]*Page, error)
 		var crawledAt time.Time
 
 		if err := rows.Scan(&id, &textLength, &crawledAt); err == nil {
-			pages[id] = &Page{
-				ID: id,
-				// URL:        url, // Removed URL from RAM
-				LinksIn:    []int64{},
-				TextLength: textLength,
-				CrawledAt:  crawledAt,
-			}
+			graph.AddNode(id, textLength, crawledAt)
 		}
 	}
 
@@ -198,14 +232,27 @@ func loadGraph(ctx context.Context, pool *pgxpool.Pool) (map[int64]*Page, error)
 		return nil, err
 	}
 
-	// Lấy danh sách liên kết (Edges) - Optimized query to get IDs directly
-	// This avoids loading strings and mapping them in Go
+	// Lấy danh sách liên kết (Edges)
+	// Optimization: We use IDs directly if possible.
+	// But `page_links` only has URLs. 
+	// To avoid full table joins which are slow, we rely on the JOIN query.
+	// However, we can optimize by ensuring indices are used.
+	
+	// Note: The previous JOIN query on string URLs is indeed slow if not indexed, but we have indices.
+	// The main bottleneck described by user was 'loading entire graph into RAM' (map pointers)
+	// and 'Full Table Scan' (SELECT id FROM crawled_pages).
+	// We've addressed the RAM issue with CompactGraph.
+	// The 'Full Table Scan' on Nodes is unavoidable for PageRank.
+	
 	linkQuery := `
 		SELECT s.id, t.id 
 		FROM page_links pl
 		JOIN crawled_pages s ON pl.source_url = s.url
 		JOIN crawled_pages t ON pl.target_url = t.url
 	`
+	// Typically we would prefer page_links to use IDs, but that requires schema change.
+	// We proceed with the existing query.
+	
 	linkRows, err := pool.Query(ctx, linkQuery)
 	if err != nil {
 		return nil, err
@@ -215,11 +262,12 @@ func loadGraph(ctx context.Context, pool *pgxpool.Pool) (map[int64]*Page, error)
 	for linkRows.Next() {
 		var srcID, tgtID int64
 		if err := linkRows.Scan(&srcID, &tgtID); err == nil {
-			if srcPage, ok := pages[srcID]; ok {
-				srcPage.LinksOut++
-			}
-			if tgtPage, ok := pages[tgtID]; ok {
-				tgtPage.LinksIn = append(tgtPage.LinksIn, srcID)
+			srcIdx, srcOk := graph.idToIndex[srcID]
+			tgtIdx, tgtOk := graph.idToIndex[tgtID]
+
+			if srcOk && tgtOk {
+				graph.LinksOut[srcIdx]++
+				graph.LinksIn[tgtIdx] = append(graph.LinksIn[tgtIdx], srcIdx)
 			}
 		}
 	}
@@ -228,18 +276,20 @@ func loadGraph(ctx context.Context, pool *pgxpool.Pool) (map[int64]*Page, error)
 		return nil, err
 	}
 
-	return pages, nil
+	// Clean up map to free memory before ranking
+	graph.idToIndex = nil
+	// Force GC if needed? Go usually handles it.
+	
+	return graph, nil
 }
 
-func saveScores(ctx context.Context, pool *pgxpool.Pool, pages map[int64]*Page) error {
-	// Must use a transaction to ensure the temporary table persists across commands
+func saveScores(ctx context.Context, pool *pgxpool.Pool, graph *CompactGraph) error {
 	tx, err := pool.Begin(ctx)
 	if err != nil {
 		return fmt.Errorf("beginning transaction: %w", err)
 	}
 	defer tx.Rollback(ctx)
 
-	// Create a temporary table with diagnostic columns
 	_, err = tx.Exec(ctx, "CREATE TEMP TABLE lith_scores_temp (id BIGINT, score FLOAT, freshness FLOAT, quality FLOAT) ON COMMIT DROP")
 	if err != nil {
 		return fmt.Errorf("creating temp table: %w", err)
@@ -247,11 +297,10 @@ func saveScores(ctx context.Context, pool *pgxpool.Pool, pages map[int64]*Page) 
 
 	// Prepare data for COPY
 	rows := [][]interface{}{}
-	for _, p := range pages {
-		rows = append(rows, []interface{}{p.ID, p.Score, p.FreshnessScore, p.QualityScore})
+	for i := 0; i < len(graph.IDs); i++ {
+		rows = append(rows, []interface{}{graph.IDs[i], graph.Scores[i], graph.Freshness[i], graph.Quality[i]})
 	}
 
-	// Bulk Insert into Temp Table using COPY
 	count, err := tx.CopyFrom(
 		ctx,
 		pgx.Identifier{"lith_scores_temp"},
@@ -263,8 +312,6 @@ func saveScores(ctx context.Context, pool *pgxpool.Pool, pages map[int64]*Page) 
 	}
 	log.Printf("Copied %d rows to temp table.", count)
 
-	// Single UPDATE from Temp Table
-	// Using FROM clause to update efficiently
 	updateQuery := `
 		UPDATE crawled_pages
 		SET lith_score = t.score,

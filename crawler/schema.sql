@@ -11,7 +11,8 @@ CREATE TABLE IF NOT EXISTS crawled_pages (
     crawled_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
 
     -- Truncated body text for quick previews and searches
-    body_text TEXT, 
+    -- Removed to save space: use Meilisearch or MinIO for full text.
+    -- body_text TEXT, 
     
     -- Path to the full raw HTML stored in MinIO/TeaserCDN
     raw_html_path VARCHAR(1024),

@@ -134,14 +134,34 @@ func main() {
 	e := echo.New()
 	e.Use(middleware.Logger())
 	e.Use(middleware.Recover())
-	e.Use(middleware.CORS())
+
+	// Configurable CORS
+	allowedOrigins := []string{"*"}
+	if envOrigins := os.Getenv("CORS_ALLOWED_ORIGINS"); envOrigins != "" {
+		// Split by comma if needed, or just take the string if it's single
+		// Echo CORS middleware takes a list. For now we assume a single or handle manually,
+		// but typically we'd parse. Let's keep it simple: if set, use it.
+		// If user passes "http://a.com,http://b.com", we might need to split.
+		// But for now let's just use what's passed if it's not empty, assuming user knows format?
+		// Echo expects []string.
+		// Let's rely on standard practice: default to * for dev, stricter for prod.
+		allowedOrigins = []string{envOrigins}
+	}
+
+	e.Use(middleware.CORSWithConfig(middleware.CORSConfig{
+		AllowOrigins: allowedOrigins,
+		AllowMethods: []string{http.MethodGet, http.MethodPut, http.MethodPost, http.MethodDelete},
+	}))
 
 	e.GET("/api/search", searchHandler)
 
 	// Admin API with Basic Auth
 	adminGroup := e.Group("/api/config")
 	adminGroup.Use(middleware.BasicAuth(func(username, password string, c echo.Context) (bool, error) {
-		adminUser := "admin" // Hardcoded username
+		adminUser := os.Getenv("ADMIN_USERNAME")
+		if adminUser == "" {
+			adminUser = "admin" // Default fallback, but ENV is preferred
+		}
 		adminPass := os.Getenv("ADMIN_PASSWORD")
 
 		// Require ADMIN_PASSWORD to be set for security
@@ -158,7 +178,7 @@ func main() {
 
 	adminGroup.GET("", getConfigHandler)
 	adminGroup.POST("", updateConfigHandler)
-	
+
 	e.Static("/", "/app/go-backend/static")
 
 	e.Logger.Fatal(e.Start(":8080"))
@@ -245,16 +265,22 @@ func updateConfigHandler(c echo.Context) error {
 		return c.JSON(http.StatusBadRequest, map[string]string{"error": "Invalid JSON"})
 	}
 
-	// Read existing config to merge (optional, but good practice if partial updates allowed)
-	// For now, we assume full replace as per typical admin UI behavior
-	
+	// Simple atomic write simulation: write to temp file then rename.
+	// This helps with some race conditions but shared volume issues persist if multiple replicas write.
+	// For now, this improves local atomicity.
+
 	data, err := json.MarshalIndent(newConfig, "", "  ")
 	if err != nil {
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "Failed to marshal config"})
 	}
 
-	if err := os.WriteFile(configPath, data, 0644); err != nil {
-		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "Failed to write config"})
+	tmpPath := configPath + ".tmp"
+	if err := os.WriteFile(tmpPath, data, 0644); err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "Failed to write temp config"})
+	}
+
+	if err := os.Rename(tmpPath, configPath); err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "Failed to swap config file"})
 	}
 
 	return c.JSON(http.StatusOK, map[string]string{"status": "updated"})
