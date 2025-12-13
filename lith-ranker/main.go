@@ -24,18 +24,18 @@ const (
 // instead of map[int64]*Page, and using int32 indices for links.
 type CompactGraph struct {
 	// Node data
-	IDs            []int64
-	Scores         []float64
-	NewScores      []float64
-	LinksOut       []int32
-	TextLengths    []int32
-	CrawledAts     []int64 // Unix timestamp
-	Freshness      []float64
-	Quality        []float64
+	IDs         []int64
+	Scores      []float64
+	NewScores   []float64
+	LinksOut    []int32
+	TextLengths []int32
+	CrawledAts  []int64 // Unix timestamp
+	Freshness   []float64
+	Quality     []float64
 
 	// Graph structure (Adjacency List using local indices)
 	// LinksIn[i] contains the list of *indices* (not IDs) that point to node i.
-	LinksIn        [][]int32
+	LinksIn [][]int32
 
 	// Map ID to Index (only used during loading, cleared after)
 	idToIndex map[int64]int32
@@ -163,8 +163,9 @@ func calculateLithRank(ctx context.Context, pool *pgxpool.Pool, maxIter int) err
 			// Iterate over indices of pages linking to i
 			for _, sourceIdx := range graph.LinksIn[i] {
 				// Access source page via index directly
-				if graph.LinksOut[sourceIdx] > 0 {
-					incomingScore += graph.Scores[sourceIdx] / float64(graph.LinksOut[sourceIdx])
+				// Must cast int32 index to int for slice access
+				if graph.LinksOut[int(sourceIdx)] > 0 {
+					incomingScore += graph.Scores[int(sourceIdx)] / float64(graph.LinksOut[int(sourceIdx)])
 				}
 			}
 			graph.NewScores[i] = baseScore + (DampingFactor * incomingScore)
@@ -234,16 +235,16 @@ func loadGraph(ctx context.Context, pool *pgxpool.Pool) (*CompactGraph, error) {
 
 	// Lấy danh sách liên kết (Edges)
 	// Optimization: We use IDs directly if possible.
-	// But `page_links` only has URLs. 
+	// But `page_links` only has URLs.
 	// To avoid full table joins which are slow, we rely on the JOIN query.
 	// However, we can optimize by ensuring indices are used.
-	
+
 	// Note: The previous JOIN query on string URLs is indeed slow if not indexed, but we have indices.
 	// The main bottleneck described by user was 'loading entire graph into RAM' (map pointers)
 	// and 'Full Table Scan' (SELECT id FROM crawled_pages).
 	// We've addressed the RAM issue with CompactGraph.
 	// The 'Full Table Scan' on Nodes is unavoidable for PageRank.
-	
+
 	linkQuery := `
 		SELECT s.id, t.id 
 		FROM page_links pl
@@ -252,7 +253,7 @@ func loadGraph(ctx context.Context, pool *pgxpool.Pool) (*CompactGraph, error) {
 	`
 	// Typically we would prefer page_links to use IDs, but that requires schema change.
 	// We proceed with the existing query.
-	
+
 	linkRows, err := pool.Query(ctx, linkQuery)
 	if err != nil {
 		return nil, err
@@ -279,7 +280,7 @@ func loadGraph(ctx context.Context, pool *pgxpool.Pool) (*CompactGraph, error) {
 	// Clean up map to free memory before ranking
 	graph.idToIndex = nil
 	// Force GC if needed? Go usually handles it.
-	
+
 	return graph, nil
 }
 

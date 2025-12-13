@@ -1,3 +1,6 @@
 asyncpg
 meilisearch
 python-dotenv
+minio
+beautifulsoup4
+lxml
