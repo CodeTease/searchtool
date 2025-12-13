@@ -234,25 +234,8 @@ func loadGraph(ctx context.Context, pool *pgxpool.Pool) (*CompactGraph, error) {
 	}
 
 	// Lấy danh sách liên kết (Edges)
-	// Optimization: We use IDs directly if possible.
-	// But `page_links` only has URLs.
-	// To avoid full table joins which are slow, we rely on the JOIN query.
-	// However, we can optimize by ensuring indices are used.
-
-	// Note: The previous JOIN query on string URLs is indeed slow if not indexed, but we have indices.
-	// The main bottleneck described by user was 'loading entire graph into RAM' (map pointers)
-	// and 'Full Table Scan' (SELECT id FROM crawled_pages).
-	// We've addressed the RAM issue with CompactGraph.
-	// The 'Full Table Scan' on Nodes is unavoidable for PageRank.
-
-	linkQuery := `
-		SELECT s.id, t.id 
-		FROM page_links pl
-		JOIN crawled_pages s ON pl.source_url = s.url
-		JOIN crawled_pages t ON pl.target_url = t.url
-	`
-	// Typically we would prefer page_links to use IDs, but that requires schema change.
-	// We proceed with the existing query.
+	// Optimized: Direct query on page_links using IDs
+	linkQuery := `SELECT source_id, target_id FROM page_links`
 
 	linkRows, err := pool.Query(ctx, linkQuery)
 	if err != nil {

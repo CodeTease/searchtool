@@ -148,9 +148,6 @@ class WebCrawler:
             console.print("[green]✓ Connected to Redis[/green]")
         except Exception as e:
             console.print(f"[red]Error connecting to Redis: {e}[/red]")
-            # Fallback or Exit? For this task, we assume Redis is critical.
-            # But maybe we should allow running without it if desired?
-            # The prompt says "Use Redis...", implying it is now required.
             raise e
 
     async def _init_database(self):
@@ -187,6 +184,19 @@ class WebCrawler:
             else:
                  console.print(f"[bold red]Lỗi: Không tìm thấy schema.sql tại {schema_path}.[/bold red]")
                  self.save_to_db = False
+            
+            # Apply link migration if needed
+            # We assume migration_links.sql exists if we are running in the new version
+            migration_path = '/app/crawler/migration_links.sql'
+            if os.path.exists(migration_path):
+                 with open(migration_path, 'r') as f:
+                    migration_sql = f.read()
+                 async with self.db_pool.acquire() as conn:
+                    try:
+                        await conn.execute(migration_sql)
+                        console.print("[green]✓ Links migration applied successfully[/green]")
+                    except Exception as e:
+                        console.print(f"[yellow]Migration warning: {e}[/yellow]")
 
         except Exception as e:
             console.print(f"[red]Error initializing database: {e}[/red]")
@@ -255,7 +265,6 @@ class WebCrawler:
         if not self.save_to_db or not self.db_pool:
             return
 
-        # Move data to local scope and clear immediately to prevent race conditions
         local_db_batch = list(self.db_batch)
         self.db_batch.clear()
 
@@ -266,6 +275,7 @@ class WebCrawler:
         if local_db_batch:
             try:
                 async with self.db_pool.acquire() as conn:
+                    # Insert pages and get IDs if needed, but here we update existing or insert new.
                     data_to_insert = [
                         (
                             p['url'],
@@ -279,6 +289,9 @@ class WebCrawler:
                             p.get('text_length', 0)
                         ) for p in local_db_batch
                     ]
+                    
+                    # We need to make sure pages exist before linking
+                    # This query handles upsert for crawled pages
                     await conn.executemany('''
                         INSERT INTO crawled_pages (url, title, meta_description, domain, depth, body_text, raw_html_path, language, text_length, tsv_document)
                         VALUES ($1, $2::varchar(512), $3, $4, $5, $6, $7, $8, $9, to_tsvector('english', COALESCE($2, '') || ' ' || COALESCE($6, '')))
@@ -292,16 +305,38 @@ class WebCrawler:
             except Exception as e:
                 console.print(f"[red]Error flushing pages: {e}[/red]")
 
-        # 2. Flush Links (Graph Data) - New for Lith Ranker
+        # 2. Flush Links (Graph Data) - USING INTEGER IDs
         if local_link_batch:
             try:
                 async with self.db_pool.acquire() as conn:
-                    await conn.executemany('''
-                        INSERT INTO page_links (source_url, target_url)
-                        VALUES ($1, $2)
-                        ON CONFLICT (source_url, target_url) DO NOTHING
-                    ''', local_link_batch)
-                self.stats['links_recorded'] += len(local_link_batch)
+                    async with conn.transaction():
+                        # Create temporary table for link pairs (source_url, target_url)
+                        await conn.execute("CREATE TEMP TABLE temp_links (source_url text, target_url text) ON COMMIT DROP")
+                        await conn.copy_records_to_table("temp_links", records=local_link_batch)
+
+                        # Ensure target URLs exist in crawled_pages (stub records if needed)
+                        # We insert targets that don't exist yet with minimal info
+                        await conn.execute('''
+                            INSERT INTO crawled_pages (url, domain, depth)
+                            SELECT DISTINCT target_url, 
+                                          split_part(split_part(target_url, '//', 2), '/', 1), 
+                                          -1 -- Unknown depth
+                            FROM temp_links
+                            WHERE target_url NOT IN (SELECT url FROM crawled_pages)
+                            ON CONFLICT (url) DO NOTHING
+                        ''')
+
+                        # Now insert into page_links using IDs lookups
+                        await conn.execute('''
+                            INSERT INTO page_links (source_id, target_id)
+                            SELECT s.id, t.id
+                            FROM temp_links l
+                            JOIN crawled_pages s ON l.source_url = s.url
+                            JOIN crawled_pages t ON l.target_url = t.url
+                            ON CONFLICT (source_id, target_id) DO NOTHING
+                        ''')
+
+                        self.stats['links_recorded'] += len(local_link_batch)
             except Exception as e:
                 console.print(f"[red]Error flushing links: {e}[/red]")
         
@@ -454,10 +489,6 @@ class WebCrawler:
         async with semaphore:
             norm_url = self._normalize_url(url)
             
-            # Atomic check and add to visited
-            # Note: For retries, we must handle removal from visited set if we want to retry.
-            # However, if we just pushed back to queue without removing from visited, this check would fail.
-            # So retry logic must remove from visited.
             if await self.redis.sadd('visited_urls', norm_url) == 0:
                  return # Already visited
             
@@ -487,16 +518,21 @@ class WebCrawler:
                     await self.redis.lpush('failed_urls', norm_url)
 
     async def _discover_sitemap(self, domain: str):
-        """Simple Sitemap Discovery (Stub for brevity)"""
-        # Logic sitemap đã có ở version cũ, giữ nguyên nếu cần
         pass
 
     async def crawl(self):
         await self._init_redis()
         
-        # Initialize queue with start_urls
+        # Initialize queue with start_urls if not empty
+        # If queue already exists, we might just continue? 
+        # But here we add start_urls again? 
+        # Better: Add only if visited_urls is empty to allow resume?
+        # For now, simplistic approach: Add them.
         for url in self.start_urls:
-             await self.redis.zadd('crawl_queue', {url: 0})
+             # Only add if not visited?
+             is_visited = await self.redis.sismember('visited_urls', url)
+             if not is_visited:
+                 await self.redis.zadd('crawl_queue', {url: 0})
         
         await self._init_database()
         self._init_minio_client()
@@ -511,22 +547,9 @@ class WebCrawler:
                 while not self.shutdown_event.is_set():
                     if self.max_pages and self.stats['total_crawled'] >= self.max_pages: break
                     
-                    # Fetch batch from Redis
-                    # zpopmin returns list of (member, score)
                     batch_data = await self.redis.zpopmin('crawl_queue', 20)
                     
                     if not batch_data:
-                        # If queue is empty, wait a bit.
-                        # In a real distributed system, we might wait longer or check for idle.
-                        await asyncio.sleep(1)
-                        # Check if we should stop? For now, loop until interrupted or max_pages.
-                        # If we just sleep, the process keeps running. 
-                        # Maybe break if empty for X seconds? 
-                        # For simplicity, and since this is a one-off crawl usually, 
-                        # we can break if queue is empty and no active tasks.
-                        # But measuring active tasks is hard here without accounting.
-                        # I'll just break if empty for now to mimic previous behavior, 
-                        # but wait 2 seconds to be sure.
                         await asyncio.sleep(2)
                         count = await self.redis.zcard('crawl_queue')
                         if count == 0:
@@ -551,15 +574,40 @@ class WebCrawler:
         console.print(f"\n[bold green]Crawl Finished![/bold green]")
         console.print(f"Pages: {self.stats['total_crawled']}, Links Recorded: {self.stats['links_recorded']}")
 
-def load_crawler_config() -> Dict:
-    path = "/app/crawler/config.json"
-    if os.path.exists(path):
-        with open(path, 'r') as f: return json.load(f)
+async def load_crawler_config_from_db() -> Dict:
+    """Load config from DB, fallback to environment/defaults."""
+    database_url = os.environ.get('DATABASE_URL')
+    if not database_url:
+        return {}
+    
+    # Simple direct connection to fetch config
+    try:
+        conn = await asyncpg.connect(database_url)
+        val = await conn.fetchval("SELECT value FROM crawler_config WHERE key = 'default'")
+        await conn.close()
+        if val:
+            return json.loads(val)
+    except Exception as e:
+        console.print(f"[yellow]Could not load config from DB: {e}[/yellow]")
+    
     return {}
 
 async def main():
     load_dotenv()
-    config = load_crawler_config()
+    
+    # Default config structure
+    default_config = {
+        'start_urls': ['https://teaserverse.dev'],
+        'max_depth': 1,
+        'save_to_db': True
+    }
+    
+    # Try loading from DB
+    db_config = await load_crawler_config_from_db()
+    
+    # Merge: DB config overrides defaults
+    config = {**default_config, **db_config}
+    
     start_urls = config.get('start_urls', ['https://teaserverse.dev'])
     
     crawler = WebCrawler(start_urls, config)

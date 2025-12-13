@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/labstack/echo/v4"
 	"github.com/labstack/echo/v4/middleware"
@@ -26,59 +27,7 @@ type SearchResult struct {
 var dbPool *pgxpool.Pool
 var meiliClient meilisearch.ServiceManager
 
-const configPath = "/app/crawler/config.json"
-
-// Struct ánh xạ với config.json
-type CrawlerConfig struct {
-	StartUrls             *[]string `json:"start_urls,omitempty"`
-	MaxDepth              *int      `json:"max_depth,omitempty"`
-	MaxConcurrentRequests *int      `json:"max_concurrent_requests,omitempty"`
-	DelayPerDomain        *float64  `json:"delay_per_domain,omitempty"`
-	UserAgent             *string   `json:"user_agent,omitempty"`
-	OutputFile            *string   `json:"output_file,omitempty"`
-	MaxPages              *int      `json:"max_pages,omitempty"`
-	MaxRequestsPerMinute  *int      `json:"max_requests_per_minute,omitempty"`
-	MaxRetries            *int      `json:"max_retries,omitempty"`
-	SaveToDb              *bool     `json:"save_to_db,omitempty"`
-	SaveToJson            *bool     `json:"save_to_json,omitempty"`
-	SslVerify             *bool     `json:"ssl_verify,omitempty"`
-	DbSslCaCertPath       *string   `json:"db_ssl_ca_cert_path,omitempty"`
-	DbBatchSize           *int      `json:"db_batch_size,omitempty"`
-	MinioStorage          *struct {
-		Enabled    *bool   `json:"enabled,omitempty"`
-		Endpoint   *string `json:"endpoint,omitempty"`
-		BucketName *string `json:"bucket_name,omitempty"`
-		Secure     *bool   `json:"secure,omitempty"`
-	} `json:"minio_storage,omitempty"`
-}
-
-// Cấu hình mặc định (Fallback)
-const defaultConfigFileContent = `{
-  "start_urls": ["https://teaserverse.dev"],
-  "max_depth": 1,
-  "max_concurrent_requests": 5,
-  "delay_per_domain": 1.0,
-  "user_agent": "TeaserBot/LocalDev",
-  "max_pages": 5,
-  "save_to_db": true,
-  "save_to_json": false,
-  "ssl_verify": false,
-  "minio_storage": {"enabled": false}
-}`
-
-func ensureConfigFileExists() error {
-	_, err := os.Stat(configPath)
-	if os.IsNotExist(err) {
-		log.Printf("Warning: %s not found. Creating default config.", configPath)
-		if err := os.WriteFile(configPath, []byte(defaultConfigFileContent), 0644); err != nil {
-			return err
-		}
-		log.Println("Default config file created successfully.")
-	} else if err != nil {
-		return err
-	}
-	return nil
-}
+const configKey = "default"
 
 func main() {
 	// ... (Code kết nối DB) ...
@@ -93,9 +42,9 @@ func main() {
 	}
 	defer dbPool.Close()
 
-	// Ensure config file exists on startup
-	if err := ensureConfigFileExists(); err != nil {
-		log.Printf("Failed to ensure config file: %v", err)
+	// Initialize Config Table
+	if err := initConfigTable(dbPool); err != nil {
+		log.Fatalf("Failed to init config table: %v", err)
 	}
 
 	// --- Meilisearch Setup ---
@@ -138,13 +87,6 @@ func main() {
 	// Configurable CORS
 	allowedOrigins := []string{"*"}
 	if envOrigins := os.Getenv("CORS_ALLOWED_ORIGINS"); envOrigins != "" {
-		// Split by comma if needed, or just take the string if it's single
-		// Echo CORS middleware takes a list. For now we assume a single or handle manually,
-		// but typically we'd parse. Let's keep it simple: if set, use it.
-		// If user passes "http://a.com,http://b.com", we might need to split.
-		// But for now let's just use what's passed if it's not empty, assuming user knows format?
-		// Echo expects []string.
-		// Let's rely on standard practice: default to * for dev, stricter for prod.
 		allowedOrigins = []string{envOrigins}
 	}
 
@@ -182,6 +124,44 @@ func main() {
 	e.Static("/", "/app/go-backend/static")
 
 	e.Logger.Fatal(e.Start(":8080"))
+}
+
+func initConfigTable(pool *pgxpool.Pool) error {
+	ctx := context.Background()
+
+	// Create table if not exists
+	_, err := pool.Exec(ctx, `
+		CREATE TABLE IF NOT EXISTS crawler_config (
+			id SERIAL PRIMARY KEY,
+			key VARCHAR(255) UNIQUE NOT NULL,
+			value JSONB NOT NULL,
+			updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+		)
+	`)
+	if err != nil {
+		return err
+	}
+
+	// Insert default config if not exists
+	defaultConfig := `{
+	  "start_urls": ["https://teaserverse.dev"],
+	  "max_depth": 1,
+	  "max_concurrent_requests": 5,
+	  "delay_per_domain": 1.0,
+	  "user_agent": "TeaserBot/LocalDev",
+	  "max_pages": 5,
+	  "save_to_db": true,
+	  "save_to_json": false,
+	  "ssl_verify": false,
+	  "minio_storage": {"enabled": false}
+	}`
+
+	_, err = pool.Exec(ctx, `
+		INSERT INTO crawler_config (key, value) VALUES ($1, $2)
+		ON CONFLICT (key) DO NOTHING
+	`, configKey, defaultConfig)
+
+	return err
 }
 
 func searchHandler(c echo.Context) error {
@@ -241,19 +221,18 @@ func searchHandler(c echo.Context) error {
 }
 
 func getConfigHandler(c echo.Context) error {
-	file, err := os.Open(configPath)
+	var valueBytes []byte
+	err := dbPool.QueryRow(context.Background(), "SELECT value FROM crawler_config WHERE key = $1", configKey).Scan(&valueBytes)
 	if err != nil {
-		// If file doesn't exist, try ensuring it (or return default content)
-		if os.IsNotExist(err) {
-			return c.JSON(http.StatusOK, json.RawMessage(defaultConfigFileContent))
+		if err == pgx.ErrNoRows {
+			return c.JSON(http.StatusNotFound, map[string]string{"error": "Config not found"})
 		}
-		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "Failed to read config"})
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "Failed to read config from DB"})
 	}
-	defer file.Close()
 
 	var config map[string]interface{}
-	if err := json.NewDecoder(file).Decode(&config); err != nil {
-		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "Failed to parse config"})
+	if err := json.Unmarshal(valueBytes, &config); err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "Failed to parse config JSON"})
 	}
 
 	return c.JSON(http.StatusOK, config)
@@ -265,22 +244,19 @@ func updateConfigHandler(c echo.Context) error {
 		return c.JSON(http.StatusBadRequest, map[string]string{"error": "Invalid JSON"})
 	}
 
-	// Simple atomic write simulation: write to temp file then rename.
-	// This helps with some race conditions but shared volume issues persist if multiple replicas write.
-	// For now, this improves local atomicity.
-
-	data, err := json.MarshalIndent(newConfig, "", "  ")
+	configJSON, err := json.Marshal(newConfig)
 	if err != nil {
 		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "Failed to marshal config"})
 	}
 
-	tmpPath := configPath + ".tmp"
-	if err := os.WriteFile(tmpPath, data, 0644); err != nil {
-		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "Failed to write temp config"})
-	}
+	_, err = dbPool.Exec(context.Background(), `
+		UPDATE crawler_config 
+		SET value = $1, updated_at = CURRENT_TIMESTAMP 
+		WHERE key = $2
+	`, configJSON, configKey)
 
-	if err := os.Rename(tmpPath, configPath); err != nil {
-		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "Failed to swap config file"})
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "Failed to update config in DB"})
 	}
 
 	return c.JSON(http.StatusOK, map[string]string{"status": "updated"})

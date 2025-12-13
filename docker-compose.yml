@@ -159,8 +159,9 @@ services:
       - NEXT_PUBLIC_API_BASE_URL=http://backend:8080
     # Live reload by mounting the source code
     # NOTE: node_modules is excluded via .dockerignore
-    volumes:
-      - ./dashboard-frontend:/app
+    # Removed volume mounting to prevent overwriting the built /app directory
+    # volumes:
+    #   - ./dashboard-frontend:/app
 
     # Dịch vụ mới: Lith Ranker (Thuật toán xếp hạng độc lập)
   lith_ranker:
