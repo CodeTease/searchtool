@@ -23,11 +23,11 @@ const (
 // Page đại diện cho một trang web trong đồ thị
 // Optimized: Uses int64 ID instead of string URL to save RAM
 type Page struct {
-	ID         int64
-	URL        string // Still keep URL for reference if needed, but not as map key
-	LinksOut   int    // Số lượng link đi ra
-	Score      float64
-	NewScore   float64
+	ID             int64
+	URL            string // Still keep URL for reference if needed, but not as map key
+	LinksOut       int    // Số lượng link đi ra
+	Score          float64
+	NewScore       float64
 	LinksIn        []int64 // List of IDs pointing to this page (replacing map[string]struct{})
 	TextLength     int
 	CrawledAt      time.Time
@@ -168,11 +168,11 @@ func calculateLithRank(ctx context.Context, pool *pgxpool.Pool, maxIter int) err
 
 func loadGraph(ctx context.Context, pool *pgxpool.Pool) (map[int64]*Page, error) {
 	pages := make(map[int64]*Page)
-	urlToID := make(map[string]int64)
+	// Removed urlToID map to save memory
 
 	// Lấy danh sách các trang (Nodes)
-	// Fetch ID as well
-	rows, err := pool.Query(ctx, "SELECT id, url, COALESCE(text_length, 0), COALESCE(crawled_at, CURRENT_TIMESTAMP) FROM crawled_pages")
+	// Not fetching URL to save memory, only fetching strictly necessary fields
+	rows, err := pool.Query(ctx, "SELECT id, COALESCE(text_length, 0), COALESCE(crawled_at, CURRENT_TIMESTAMP) FROM crawled_pages")
 	if err != nil {
 		return nil, err
 	}
@@ -180,48 +180,54 @@ func loadGraph(ctx context.Context, pool *pgxpool.Pool) (map[int64]*Page, error)
 
 	for rows.Next() {
 		var id int64
-		var url string
 		var textLength int
 		var crawledAt time.Time
 
-		if err := rows.Scan(&id, &url, &textLength, &crawledAt); err == nil {
+		if err := rows.Scan(&id, &textLength, &crawledAt); err == nil {
 			pages[id] = &Page{
-				ID:         id,
-				URL:        url,
+				ID: id,
+				// URL:        url, // Removed URL from RAM
 				LinksIn:    []int64{},
 				TextLength: textLength,
 				CrawledAt:  crawledAt,
 			}
-			urlToID[url] = id
 		}
 	}
 
-	// Lấy danh sách liên kết (Edges)
-	linkRows, err := pool.Query(ctx, "SELECT source_url, target_url FROM page_links")
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	// Lấy danh sách liên kết (Edges) - Optimized query to get IDs directly
+	// This avoids loading strings and mapping them in Go
+	linkQuery := `
+		SELECT s.id, t.id 
+		FROM page_links pl
+		JOIN crawled_pages s ON pl.source_url = s.url
+		JOIN crawled_pages t ON pl.target_url = t.url
+	`
+	linkRows, err := pool.Query(ctx, linkQuery)
 	if err != nil {
 		return nil, err
 	}
 	defer linkRows.Close()
 
 	for linkRows.Next() {
-		var source, target string
-		if err := linkRows.Scan(&source, &target); err == nil {
-			// Resolve URLs to IDs
-			srcID, srcOk := urlToID[source]
-			tgtID, tgtOk := urlToID[target]
-
-			if srcOk && tgtOk {
-				if srcPage, ok := pages[srcID]; ok {
-					srcPage.LinksOut++
-				}
-				if tgtPage, ok := pages[tgtID]; ok {
-					tgtPage.LinksIn = append(tgtPage.LinksIn, srcID)
-				}
+		var srcID, tgtID int64
+		if err := linkRows.Scan(&srcID, &tgtID); err == nil {
+			if srcPage, ok := pages[srcID]; ok {
+				srcPage.LinksOut++
+			}
+			if tgtPage, ok := pages[tgtID]; ok {
+				tgtPage.LinksIn = append(tgtPage.LinksIn, srcID)
 			}
 		}
 	}
 
-	// urlToID map will be garbage collected after this function returns
+	if err := linkRows.Err(); err != nil {
+		return nil, err
+	}
+
 	return pages, nil
 }
 
