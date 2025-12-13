@@ -1,0 +1,35 @@
+name: Lith Ranker CI
+
+on:
+  push:
+    branches: [ "main", "master" ]
+    paths: ['lith-ranker/**']
+  pull_request:
+    branches: [ "main", "master" ]
+
+jobs:
+  build:
+    name: Build Lith Ranker
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ./lith-ranker
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: '1.21'
+
+    - name: Download dependencies
+      run: go mod download
+
+    - name: Verify dependencies
+      run: go mod verify
+
+    - name: Build
+      run: go build -v ./...
+
+    - name: Test
+      run: go test -v ./...

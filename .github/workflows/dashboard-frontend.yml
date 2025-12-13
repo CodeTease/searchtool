@@ -1,0 +1,35 @@
+name: Dashboard Frontend CI
+
+on:
+  push:
+    branches: [ "main", "master" ]
+    paths: ['dashboard-frontend/**']
+  pull_request:
+    branches: [ "main", "master" ]
+
+jobs:
+  build:
+    name: Build Dashboard Frontend
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ./dashboard-frontend
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '22' # Next.js mới nhất yêu cầu Node >=20.9.0
+        cache: 'npm'
+        cache-dependency-path: dashboard-frontend/package-lock.json
+
+    - name: Install dependencies
+      run: npm ci
+
+    - name: Lint
+      run: npm run lint
+      continue-on-error: true
+
+    - name: Build
+      run: npm run build
