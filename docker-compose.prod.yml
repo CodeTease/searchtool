@@ -1,8 +1,20 @@
 version: '3.8'
 
-# --- 1. DỊCH VỤ HẠ TẦNG (Database, Queue, Storage) ---
+# --- Production Docker Compose Configuration ---
+# Instructions for Scalability:
+# 1. Database (PostgreSQL):
+#    - For High Availability, use a managed service (AWS RDS, Google Cloud SQL) or deploy a Primary-Replica cluster (e.g., using Bitnami PostgreSQL with Repmgr).
+#    - Set DATABASE_URL in .env to point to the connection pooler (e.g., PgBouncer) or the primary instance.
+# 2. Redis:
+#    - Use Redis Sentinel or Cluster for failover. Update REDIS_HOST/REDIS_PORT accordingly.
+# 3. Load Balancing:
+#    - Deploy behind Nginx or Traefik. Only expose ports 80/443.
+#    - Run multiple instances of 'backend' and 'crawler' and 'js_renderer' as needed.
+
 services:
-  # PostgreSQL: Nơi lưu trữ chỉ mục (Full-Text Search)
+  # In production, we often skip hosting DB/Redis inside Docker Compose if using Managed Services.
+  # However, for a self-hosted single-node production setup, this configuration is hardened.
+
   postgres:
     image: postgres:16-alpine
     restart: always
@@ -12,27 +24,24 @@ services:
       POSTGRES_DB: ${POSTGRES_DB}
     volumes:
       - postgres_data:/var/lib/postgresql/data
-    # Ports exposed only to internal network by default
-    # ports:
-    #   - "5432:5432" 
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
-      interval: 5s
-      timeout: 5s
-      retries: 5
+    # No ports exposed to host
     networks:
       - teaser_net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
 
-  # Redis/Valkey: Hàng đợi (Queue)
   redis:
     image: redis:7-alpine
     restart: always
+    command: redis-server --appendonly yes
+    volumes:
+      - redis_data:/data
     networks:
       - teaser_net
-    # ports:
-    #   - "6379:6379"
 
-  # MinIO (Optional S3 Storage): Lưu trữ Raw HTML
   minio:
     image: quay.io/minio/minio:latest
     restart: always
@@ -42,9 +51,6 @@ services:
       MINIO_ROOT_PASSWORD: ${MINIO_SECRET_KEY}
     volumes:
       - minio_data:/data
-    # ports:
-    #   - "9000:9000"
-    #   - "9001:9001"
     networks:
       - teaser_net
     healthcheck:
@@ -53,29 +59,23 @@ services:
       timeout: 20s
       retries: 3
 
-  # Meilisearch: Công cụ tìm kiếm mới
   meilisearch:
     image: getmeili/meilisearch:latest
     restart: always
     environment:
       MEILI_MASTER_KEY: ${MEILI_MASTER_KEY}
+      MEILI_ENV: "production"
       MEILI_NO_ANALYTICS: "true"
     volumes:
       - meili_data:/meili_data
-    # ports:
-    #   - "7700:7700"
     networks:
       - teaser_net
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:7700/health"]
-      interval: 5s
-      timeout: 1s
-      retries: 30
+      interval: 10s
+      timeout: 5s
+      retries: 5
 
-
-  # --- 2. DỊCH VỤ ỨNG DỤNG (Go và Python) ---
-  
-  # Dashboard Backend (Go): API/Search Logic/Management
   backend:
     build: 
       context: ./go-backend
@@ -88,56 +88,40 @@ services:
       MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY}
       MINIO_SECRET_KEY: ${MINIO_SECRET_KEY}
       ADMIN_PASSWORD: ${ADMIN_PASSWORD}
+      MEILI_HOST: http://meilisearch:7700
+      MEILI_API_KEY: ${MEILI_MASTER_KEY}
     volumes:
-      # Mount thư mục mã nguồn Go vào /app
-      - ./go-backend:/app:rw
-      # Share config with crawler
       - crawler_config:/app/crawler
-    ports:
-      - "8080:8080"
-    depends_on:
-      - postgres
-      - redis
     networks:
       - teaser_net
+    # In production, use a reverse proxy to map this to an external port/domain
+    # expose:
+    #   - "8080"
 
-  # Crawler (Python): Thu thập và Làm giàu Dữ liệu
   crawler:
     build: 
       context: . 
       dockerfile: Dockerfile.Crawler
-    restart: on-failure
+    restart: always
     environment:
       DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
       MINIO_ENDPOINT: minio:9000
       MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY}
       MINIO_SECRET_KEY: ${MINIO_SECRET_KEY}
     volumes:
-      # Mount thư mục gốc vào /app cho crawler
-      - ./:/app
-      # Ensure config path is consistent
       - crawler_config:/app/crawler
-    depends_on:
-      - postgres
-      - redis
-      - minio
     networks:
       - teaser_net
 
-  # Indexer Worker (Python): Đồng bộ Postgres -> Meilisearch
   indexer_worker:
     build:
       context: .
       dockerfile: indexer/Dockerfile.Indexer
-    restart: on-failure
-    # command: python indexer.py # CMD đã có trong Dockerfile
+    restart: always
     environment:
       DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
       MEILI_HOST: http://meilisearch:7700
       MEILI_API_KEY: ${MEILI_MASTER_KEY}
-    volumes:
-       # Mount thư mục indexer để live-reload
-      - ./indexer:/app
     depends_on:
       postgres:
         condition: service_healthy
@@ -146,56 +130,47 @@ services:
     networks:
       - teaser_net
 
-  # Dashboard Frontend (Next.js)
   dashboard:
     build:
       context: ./dashboard-frontend
       dockerfile: Dockerfile
-    ports:
-      - "3000:3000"
+    restart: always
     networks:
       - teaser_net
     environment:
-      - NEXT_PUBLIC_API_BASE_URL=http://backend:8080
-    # Live reload by mounting the source code
-    # NOTE: node_modules is excluded via .dockerignore
-    volumes:
-      - ./dashboard-frontend:/app
+      - NEXT_PUBLIC_API_BASE_URL=${API_BASE_URL} # Must be set to public URL in prod
+    # expose:
+    #   - "3000"
 
-    # Dịch vụ mới: Lith Ranker (Thuật toán xếp hạng độc lập)
   lith_ranker:
     build:
-      context: ./lith-ranker # Đường dẫn tới thư mục code Lith
+      context: ./lith-ranker
       dockerfile: Dockerfile
-    restart: unless-stopped
+    restart: always
     environment:
-      # Kết nối tới cùng database với Crawler và Backend
       DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
-      LITH_INTERVAL_MINUTES: 60  # Tính toán lại mỗi 60 phút
-      LITH_MAX_ITERATIONS: 20    # Số lần lặp để hội tụ
+      LITH_INTERVAL_MINUTES: 60
+      LITH_MAX_ITERATIONS: 20
     depends_on:
       postgres:
         condition: service_healthy
     networks:
       - teaser_net
 
-  # JS Renderer (Node.js + Playwright)
   js_renderer:
     build:
       context: ./js-renderer
       dockerfile: Dockerfile
-    restart: on-failure
-    ports:
-      - "8888:8888"
+    restart: always
     networks:
       - teaser_net
 
-# --- 3. VOLUMES và NETWORKS ---
 volumes:
   postgres_data:
   minio_data:
   meili_data:
-  crawler_config: # New shared volume for config
+  redis_data:
+  crawler_config:
 
 networks:
   teaser_net:

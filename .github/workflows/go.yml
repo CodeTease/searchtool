@@ -1,0 +1,66 @@
+name: Go Services
+
+on:
+  push:
+    branches: [ "main", "master" ]
+    paths:
+      - 'go-backend/**'
+      - 'lith-ranker/**'
+  pull_request:
+    branches: [ "main", "master" ]
+    paths:
+      - 'go-backend/**'
+      - 'lith-ranker/**'
+
+jobs:
+  build-backend:
+    name: Build Go Backend
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ./go-backend
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: '1.21'
+
+    - name: Download dependencies
+      run: go mod download
+
+    - name: Verify dependencies
+      run: go mod verify
+
+    - name: Build
+      run: go build -v ./...
+
+    - name: Test
+      run: go test -v ./...
+
+  build-lith-ranker:
+    name: Build Lith Ranker
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ./lith-ranker
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: '1.21'
+
+    - name: Download dependencies
+      run: go mod download
+
+    - name: Verify dependencies
+      run: go mod verify
+
+    - name: Build
+      run: go build -v ./...
+
+    - name: Test
+      run: go test -v ./...

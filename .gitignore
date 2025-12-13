@@ -2,3 +2,8 @@
 .env
 venv/
 lith-ranker/lith-ranker
+
+# Vegh files
+*.vegh 
+.veghcache
+.veghhooks.json

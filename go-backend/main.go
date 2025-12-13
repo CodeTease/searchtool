@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"log"
 	"net/http"
@@ -25,10 +26,9 @@ type SearchResult struct {
 var dbPool *pgxpool.Pool
 var meiliClient meilisearch.ServiceManager
 
-// configMutex không còn cần thiết nếu các handler config không được triển khai đầy đủ
-// const configPath = "/app/crawler/config.json" // Giữ nguyên để tránh lỗi compile nếu có tham chiếu
+const configPath = "/app/crawler/config.json"
 
-// Struct ánh xạ với config.json (dùng con trỏ để merge cho dễ)
+// Struct ánh xạ với config.json
 type CrawlerConfig struct {
 	StartUrls             *[]string `json:"start_urls,omitempty"`
 	MaxDepth              *int      `json:"max_depth,omitempty"`
@@ -52,7 +52,7 @@ type CrawlerConfig struct {
 	} `json:"minio_storage,omitempty"`
 }
 
-// Cấu hình mặc định siêu nhẹ
+// Cấu hình mặc định (Fallback)
 const defaultConfigFileContent = `{
   "start_urls": ["https://teaserverse.dev"],
   "max_depth": 1,
@@ -66,13 +66,10 @@ const defaultConfigFileContent = `{
   "minio_storage": {"enabled": false}
 }`
 
-// ensureConfigFileExists không được sử dụng trong main.go hiện tại (nên xóa nếu nó không cần thiết,
-// nhưng vì nó có thể được gọi trong các handler config chưa được triển khai, ta giữ nguyên logic bên dưới)
 func ensureConfigFileExists() error {
-	const configPath = "/app/crawler/config.json"
 	_, err := os.Stat(configPath)
 	if os.IsNotExist(err) {
-		log.Printf("Warning: %s not found. Creating default, lightweight config.", configPath)
+		log.Printf("Warning: %s not found. Creating default config.", configPath)
 		if err := os.WriteFile(configPath, []byte(defaultConfigFileContent), 0644); err != nil {
 			return err
 		}
@@ -84,7 +81,7 @@ func ensureConfigFileExists() error {
 }
 
 func main() {
-	// ... (Code kết nối DB giữ nguyên) ...
+	// ... (Code kết nối DB) ...
 	dbURL := os.Getenv("DATABASE_URL")
 	if dbURL == "" {
 		log.Fatal("DATABASE_URL must be set")
@@ -95,6 +92,11 @@ func main() {
 		log.Fatalf("DB Error: %v", err)
 	}
 	defer dbPool.Close()
+
+	// Ensure config file exists on startup
+	if err := ensureConfigFileExists(); err != nil {
+		log.Printf("Failed to ensure config file: %v", err)
+	}
 
 	// --- Meilisearch Setup ---
 	meiliHost := os.Getenv("MEILI_HOST")
@@ -119,24 +121,44 @@ func main() {
 						"attribute",
 						"sort",
 						"exactness",
-						"lith_score:desc", // Lith Score is King!
+						"lith_score:desc",
 					},
 					SortableAttributes: []string{"lith_score", "crawled_at"},
 				})
 				return
 			}
-			// Sleep manually implementation removed for brevity, assume retry
+			// Sleep handled by Docker restart policy or user patience
 		}
 	}()
 
 	e := echo.New()
 	e.Use(middleware.Logger())
 	e.Use(middleware.Recover())
-	e.Use(middleware.CORS()) // Allow Dashboard to call API
+	e.Use(middleware.CORS())
 
 	e.GET("/api/search", searchHandler)
-	e.GET("/api/config", getConfigHandler)
-	e.POST("/api/config", updateConfigHandler)
+
+	// Admin API with Basic Auth
+	adminGroup := e.Group("/api/config")
+	adminGroup.Use(middleware.BasicAuth(func(username, password string, c echo.Context) (bool, error) {
+		adminUser := "admin" // Hardcoded username
+		adminPass := os.Getenv("ADMIN_PASSWORD")
+
+		// Require ADMIN_PASSWORD to be set for security
+		if adminPass == "" {
+			return false, nil
+		}
+
+		if subtle.ConstantTimeCompare([]byte(username), []byte(adminUser)) == 1 &&
+			subtle.ConstantTimeCompare([]byte(password), []byte(adminPass)) == 1 {
+			return true, nil
+		}
+		return false, nil
+	}))
+
+	adminGroup.GET("", getConfigHandler)
+	adminGroup.POST("", updateConfigHandler)
+	
 	e.Static("/", "/app/go-backend/static")
 
 	e.Logger.Fatal(e.Start(":8080"))
@@ -183,7 +205,6 @@ func searchHandler(c echo.Context) error {
 			res.LithScore = score
 		}
 
-		// Snippet logic (giữ nguyên như cũ)
 		if formatted, ok := hitMap["_formatted"].(map[string]interface{}); ok {
 			if hSnippet, ok := formatted["body_text"].(string); ok {
 				res.Snippet = hSnippet
@@ -200,12 +221,41 @@ func searchHandler(c echo.Context) error {
 }
 
 func getConfigHandler(c echo.Context) error {
-	// Hàm này vẫn chưa được triển khai hoàn chỉnh.
-	// Tuy nhiên, việc loại bỏ import `sync` là đúng vì nó không được dùng trong phiên bản hiện tại.
-	return c.JSON(http.StatusOK, map[string]string{"status": "not_implemented"})
+	file, err := os.Open(configPath)
+	if err != nil {
+		// If file doesn't exist, try ensuring it (or return default content)
+		if os.IsNotExist(err) {
+			return c.JSON(http.StatusOK, json.RawMessage(defaultConfigFileContent))
+		}
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "Failed to read config"})
+	}
+	defer file.Close()
+
+	var config map[string]interface{}
+	if err := json.NewDecoder(file).Decode(&config); err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "Failed to parse config"})
+	}
+
+	return c.JSON(http.StatusOK, config)
 }
 
 func updateConfigHandler(c echo.Context) error {
-	// Hàm này vẫn chưa được triển khai hoàn chỉnh.
-	return c.JSON(http.StatusOK, map[string]string{"status": "not_implemented"})
+	var newConfig map[string]interface{}
+	if err := c.Bind(&newConfig); err != nil {
+		return c.JSON(http.StatusBadRequest, map[string]string{"error": "Invalid JSON"})
+	}
+
+	// Read existing config to merge (optional, but good practice if partial updates allowed)
+	// For now, we assume full replace as per typical admin UI behavior
+	
+	data, err := json.MarshalIndent(newConfig, "", "  ")
+	if err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "Failed to marshal config"})
+	}
+
+	if err := os.WriteFile(configPath, data, 0644); err != nil {
+		return c.JSON(http.StatusInternalServerError, map[string]string{"error": "Failed to write config"})
+	}
+
+	return c.JSON(http.StatusOK, map[string]string{"status": "updated"})
 }
