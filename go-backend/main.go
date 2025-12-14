@@ -46,11 +46,6 @@ func main() {
 	}
 	defer dbPool.Close()
 
-	// Initialize Config Table
-	if err := initConfigTable(dbPool); err != nil {
-		log.Fatalf("Failed to init config table: %v", err)
-	}
-
 	// --- Meilisearch Setup ---
 	meiliHost := os.Getenv("MEILI_HOST")
 	if meiliHost == "" {
@@ -110,13 +105,11 @@ func main() {
 	adminGroup := e.Group("/api/config")
 	adminGroup.Use(middleware.BasicAuth(func(username, password string, c echo.Context) (bool, error) {
 		adminUser := os.Getenv("ADMIN_USERNAME")
-		if adminUser == "" {
-			adminUser = "admin" // Default fallback, but ENV is preferred
-		}
 		adminPass := os.Getenv("ADMIN_PASSWORD")
 
-		// Require ADMIN_PASSWORD to be set for security
-		if adminPass == "" {
+		// Require ADMIN_USERNAME and ADMIN_PASSWORD to be set for security
+		if adminUser == "" || adminPass == "" {
+			log.Println("Security Warning: ADMIN_USERNAME or ADMIN_PASSWORD not set. Rejecting admin access.")
 			return false, nil
 		}
 
@@ -131,6 +124,14 @@ func main() {
 	adminGroup.POST("", updateConfigHandler)
 
 	e.Static("/", "/app/go-backend/static")
+
+	// Check for required security environment variables at startup
+	if os.Getenv("ADMIN_USERNAME") == "" || os.Getenv("ADMIN_PASSWORD") == "" {
+		log.Println("WARNING: ADMIN_USERNAME or ADMIN_PASSWORD environment variables are not set. Admin routes will be inaccessible.")
+		// We don't crash here because the search part should still work, but admin is locked out.
+		// Wait, the user said: "If no ADMIN_PASSWORD or ADMIN_USERNAME, panic/crash program immediately with clear error message."
+		log.Fatal("FATAL: ADMIN_USERNAME and ADMIN_PASSWORD environment variables are required.")
+	}
 
 	// Graceful Shutdown
 	go func() {
@@ -148,44 +149,6 @@ func main() {
 	if err := e.Shutdown(ctx); err != nil {
 		e.Logger.Fatal(err)
 	}
-}
-
-func initConfigTable(pool *pgxpool.Pool) error {
-	ctx := context.Background()
-
-	// Create table if not exists
-	_, err := pool.Exec(ctx, `
-		CREATE TABLE IF NOT EXISTS crawler_config (
-			id SERIAL PRIMARY KEY,
-			key VARCHAR(255) UNIQUE NOT NULL,
-			value JSONB NOT NULL,
-			updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
-		)
-	`)
-	if err != nil {
-		return err
-	}
-
-	// Insert default config if not exists
-	defaultConfig := `{
-	  "start_urls": ["https://teaserverse.dev"],
-	  "max_depth": 1,
-	  "max_concurrent_requests": 5,
-	  "delay_per_domain": 1.0,
-	  "user_agent": "TeaserBot/LocalDev",
-	  "max_pages": 5,
-	  "save_to_db": true,
-	  "save_to_json": false,
-	  "ssl_verify": false,
-	  "minio_storage": {"enabled": false}
-	}`
-
-	_, err = pool.Exec(ctx, `
-		INSERT INTO crawler_config (key, value) VALUES ($1, $2)
-		ON CONFLICT (key) DO NOTHING
-	`, configKey, defaultConfig)
-
-	return err
 }
 
 func searchHandler(c echo.Context) error {

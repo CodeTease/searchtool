@@ -4,12 +4,10 @@ import (
 	"context"
 	"fmt"
 	"log"
-	"math"
 	"os"
 	"strconv"
 	"time"
 
-	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -19,56 +17,6 @@ const (
 	DefaultMaxIterations = 20   // Number of iterations for score calculation
 	DefaultInterval      = 60   // Minutes (Default recalculation every hour)
 )
-
-// CompactGraph optimizes memory usage using parallel arrays (Struct of Arrays)
-// instead of map[int64]*Page, and using int32 indices for links.
-type CompactGraph struct {
-	// Node data
-	IDs         []int64
-	Scores      []float64
-	NewScores   []float64
-	LinksOut    []int32
-	TextLengths []int32
-	CrawledAts  []int64 // Unix timestamp
-	Freshness   []float64
-	Quality     []float64
-
-	// Graph structure (Adjacency List using local indices)
-	// LinksIn[i] contains the list of *indices* (not IDs) that point to node i.
-	LinksIn [][]int32
-
-	// Map ID to Index (only used during loading, cleared after)
-	idToIndex map[int64]int32
-}
-
-func NewCompactGraph(capacity int) *CompactGraph {
-	return &CompactGraph{
-		IDs:         make([]int64, 0, capacity),
-		Scores:      make([]float64, 0, capacity),
-		NewScores:   make([]float64, 0, capacity),
-		LinksOut:    make([]int32, 0, capacity),
-		TextLengths: make([]int32, 0, capacity),
-		CrawledAts:  make([]int64, 0, capacity),
-		Freshness:   make([]float64, 0, capacity),
-		Quality:     make([]float64, 0, capacity),
-		LinksIn:     make([][]int32, 0, capacity),
-		idToIndex:   make(map[int64]int32, capacity),
-	}
-}
-
-func (g *CompactGraph) AddNode(id int64, textLength int, crawledAt time.Time) {
-	idx := int32(len(g.IDs))
-	g.IDs = append(g.IDs, id)
-	g.Scores = append(g.Scores, 0.0)
-	g.NewScores = append(g.NewScores, 0.0)
-	g.LinksOut = append(g.LinksOut, 0)
-	g.TextLengths = append(g.TextLengths, int32(textLength))
-	g.CrawledAts = append(g.CrawledAts, crawledAt.Unix())
-	g.Freshness = append(g.Freshness, 0.0)
-	g.Quality = append(g.Quality, 0.0)
-	g.LinksIn = append(g.LinksIn, []int32{}) // Initialize empty slice
-	g.idToIndex[id] = idx
-}
 
 func main() {
 	log.Println("Lith Ranker: Starting up...")
@@ -132,196 +80,169 @@ func runLithCycle(pool *pgxpool.Pool, maxIter int) {
 	log.Println("--- Cycle Finished ---")
 }
 
-// calculateLithRank executes the PageRank algorithm
+// calculateLithRank executes the PageRank algorithm using SQL to avoid OOM
 func calculateLithRank(ctx context.Context, pool *pgxpool.Pool, maxIter int) error {
-	// S1: Load graph from DB to RAM (Optimized)
-	graph, err := loadGraph(ctx, pool)
-	if err != nil {
-		return err
-	}
-
-	count := len(graph.IDs)
-	if count == 0 {
-		log.Println("Graph is empty. Nothing to rank.")
-		return nil
-	}
-	log.Printf("Graph loaded: %d pages.", count)
-
-	// S2: Initialize initial score (1.0 / N)
-	initialScore := 1.0 / float64(count)
-	for i := 0; i < count; i++ {
-		graph.Scores[i] = initialScore
-	}
-
-	// S3: Iteration for calculation (The core algorithm)
-	// Formula: PR(A) = (1-d)/N + d * Sum(PR(B)/L(B))
-	baseScore := (1.0 - DampingFactor) / float64(count)
-
-	for iter := 0; iter < maxIter; iter++ {
-		for i := 0; i < count; i++ {
-			incomingScore := 0.0
-			// Iterate over indices of pages linking to i
-			for _, sourceIdx := range graph.LinksIn[i] {
-				// Access source page via index directly
-				// Must cast int32 index to int for slice access
-				if graph.LinksOut[int(sourceIdx)] > 0 {
-					incomingScore += graph.Scores[int(sourceIdx)] / float64(graph.LinksOut[int(sourceIdx)])
-				}
-			}
-			graph.NewScores[i] = baseScore + (DampingFactor * incomingScore)
-		}
-
-		// Swap scores
-		copy(graph.Scores, graph.NewScores)
-	}
-
-	// Calculate Composite Score (Freshness + DepthIndex)
-	now := time.Now().Unix()
-	for i := 0; i < count; i++ {
-		// Freshness: max(0, 1 - AgeInDays/365)
-		ageSeconds := now - graph.CrawledAts[i]
-		ageDays := float64(ageSeconds) / (24.0 * 3600.0)
-		freshness := math.Max(0, 1.0-(ageDays/365.0))
-
-		// DepthIndex: log10(TextLength)
-		depthIndex := 0.0
-		if graph.TextLengths[i] > 0 {
-			depthIndex = math.Log10(float64(graph.TextLengths[i]))
-		}
-
-		// Store component scores
-		graph.Freshness[i] = freshness
-		graph.Quality[i] = depthIndex
-
-		// Composite Formula
-		graph.Scores[i] = (graph.Scores[i] * 0.8) + (freshness * 0.1) + (depthIndex * 0.1)
-	}
-
-	// S4: Save results to DB (Optimized with Temp Table)
-	return saveScores(ctx, pool, graph)
-}
-
-func loadGraph(ctx context.Context, pool *pgxpool.Pool) (*CompactGraph, error) {
-	// Estimate capacity
-	var count int
-	err := pool.QueryRow(ctx, "SELECT COUNT(*) FROM crawled_pages").Scan(&count)
-	if err != nil {
-		count = 10000 // Fallback
-	}
-
-	// Fail-safe: Check against Max Node Limit to prevent OOM on massive graphs
-	// Default limit 5 million nodes if not set.
-	maxNodes := 5000000
-	if val := os.Getenv("LITH_MAX_NODES"); val != "" {
-		if i, err := strconv.Atoi(val); err == nil && i > 0 {
-			maxNodes = i
-		}
-	}
-
-	if count > maxNodes {
-		return nil, fmt.Errorf("graph size (%d) exceeds safety limit (%d). aborting to prevent OOM", count, maxNodes)
-	}
-
-	graph := NewCompactGraph(count)
-
-	// Fetch list of pages (Nodes)
-	// Only fetch strictly necessary fields.
-	rows, err := pool.Query(ctx, "SELECT id, COALESCE(text_length, 0), COALESCE(crawled_at, CURRENT_TIMESTAMP) FROM crawled_pages")
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	for rows.Next() {
-		var id int64
-		var textLength int
-		var crawledAt time.Time
-
-		if err := rows.Scan(&id, &textLength, &crawledAt); err == nil {
-			graph.AddNode(id, textLength, crawledAt)
-		}
-	}
-
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-
-	// Fetch list of links (Edges)
-	// Optimized: Direct query on page_links using IDs
-	linkQuery := `SELECT source_id, target_id FROM page_links`
-
-	linkRows, err := pool.Query(ctx, linkQuery)
-	if err != nil {
-		return nil, err
-	}
-	defer linkRows.Close()
-
-	for linkRows.Next() {
-		var srcID, tgtID int64
-		if err := linkRows.Scan(&srcID, &tgtID); err == nil {
-			srcIdx, srcOk := graph.idToIndex[srcID]
-			tgtIdx, tgtOk := graph.idToIndex[tgtID]
-
-			if srcOk && tgtOk {
-				graph.LinksOut[srcIdx]++
-				graph.LinksIn[tgtIdx] = append(graph.LinksIn[tgtIdx], srcIdx)
-			}
-		}
-	}
-
-	if err := linkRows.Err(); err != nil {
-		return nil, err
-	}
-
-	// Clean up map to free memory before ranking
-	graph.idToIndex = nil
-	// Force GC if needed? Go usually handles it.
-
-	return graph, nil
-}
-
-func saveScores(ctx context.Context, pool *pgxpool.Pool, graph *CompactGraph) error {
+	// Start transaction
 	tx, err := pool.Begin(ctx)
 	if err != nil {
 		return fmt.Errorf("beginning transaction: %w", err)
 	}
 	defer tx.Rollback(ctx)
 
-	_, err = tx.Exec(ctx, "CREATE TEMP TABLE lith_scores_temp (id BIGINT, score FLOAT, freshness FLOAT, quality FLOAT) ON COMMIT DROP")
+	// 1. Count pages to determine graph size
+	var count int64
+	err = tx.QueryRow(ctx, "SELECT COUNT(*) FROM crawled_pages").Scan(&count)
 	if err != nil {
-		return fmt.Errorf("creating temp table: %w", err)
+		return fmt.Errorf("counting pages: %w", err)
 	}
-
-	// Prepare data for COPY
-	rows := [][]interface{}{}
-	for i := 0; i < len(graph.IDs); i++ {
-		rows = append(rows, []interface{}{graph.IDs[i], graph.Scores[i], graph.Freshness[i], graph.Quality[i]})
+	if count == 0 {
+		log.Println("Graph is empty. Nothing to rank.")
+		return nil
 	}
+	log.Printf("Graph size: %d pages.", count)
 
-	count, err := tx.CopyFrom(
-		ctx,
-		pgx.Identifier{"lith_scores_temp"},
-		[]string{"id", "score", "freshness", "quality"},
-		pgx.CopyFromRows(rows),
-	)
+	// 2. Initialize Ranking Temp Table
+	// We store ID, current Score, and outgoing link count
+	log.Println("Initializing ranking temporary table...")
+	_, err = tx.Exec(ctx, `
+		CREATE TEMP TABLE pr_nodes (
+			id BIGINT PRIMARY KEY,
+			score FLOAT8,
+			links_out INT
+		) ON COMMIT DROP
+	`)
 	if err != nil {
-		return fmt.Errorf("copying to temp table: %w", err)
+		return fmt.Errorf("creating pr_nodes: %w", err)
 	}
-	log.Printf("Copied %d rows to temp table.", count)
 
-	updateQuery := `
-		UPDATE crawled_pages
-		SET lith_score = t.score,
-		    freshness_score = t.freshness,
-		    quality_score = t.quality
-		FROM lith_scores_temp t
-		WHERE crawled_pages.id = t.id
-	`
-	cmdTag, err := tx.Exec(ctx, updateQuery)
+	initialScore := 1.0 / float64(count)
+
+	// Populate pr_nodes
+	// We calculate links_out once.
+	_, err = tx.Exec(ctx, `
+		INSERT INTO pr_nodes (id, score, links_out)
+		SELECT
+			cp.id,
+			$1,
+			(SELECT count(*) FROM page_links WHERE source_id = cp.id)
+		FROM crawled_pages cp
+	`, initialScore)
 	if err != nil {
-		return fmt.Errorf("updating main table: %w", err)
+		return fmt.Errorf("populating pr_nodes: %w", err)
 	}
 
-	log.Printf("Updated %d rows in crawled_pages.", cmdTag.RowsAffected())
+	// 3. Iteration (Power Method)
+	baseScore := (1.0 - DampingFactor) / float64(count)
+
+	log.Printf("Starting %d iterations...", maxIter)
+	for i := 0; i < maxIter; i++ {
+		if i%5 == 0 {
+			log.Printf("Iteration %d/%d", i+1, maxIter)
+		}
+
+		// Calculate new scores into a temporary structure
+		// PR(target) = baseScore + d * SUM(source.score / source.links_out)
+
+		_, err = tx.Exec(ctx, `
+			CREATE TEMP TABLE pr_next_scores (
+				id BIGINT PRIMARY KEY,
+				score FLOAT8
+			) ON COMMIT DROP
+		`)
+		if err != nil {
+			return fmt.Errorf("creating pr_next_scores: %w", err)
+		}
+
+		// Calculate inbound scores and insert combined result
+		_, err = tx.Exec(ctx, `
+			WITH inbound AS (
+				SELECT
+					l.target_id,
+					SUM(s.score / GREATEST(s.links_out, 1)) as val
+				FROM page_links l
+				JOIN pr_nodes s ON l.source_id = s.id
+				GROUP BY l.target_id
+			)
+			INSERT INTO pr_next_scores (id, score)
+			SELECT
+				n.id,
+				$1 + $2 * COALESCE(i.val, 0)
+			FROM pr_nodes n
+			LEFT JOIN inbound i ON n.id = i.target_id
+		`, baseScore, DampingFactor)
+		if err != nil {
+			return fmt.Errorf("iteration %d calculation: %w", i, err)
+		}
+
+		// Update pr_nodes with the new scores
+		_, err = tx.Exec(ctx, `
+			UPDATE pr_nodes n
+			SET score = next.score
+			FROM pr_next_scores next
+			WHERE n.id = next.id
+		`)
+		if err != nil {
+			return fmt.Errorf("iteration %d update: %w", i, err)
+		}
+
+		// Cleanup next_scores for next iteration
+		_, err = tx.Exec(ctx, "DROP TABLE pr_next_scores")
+		if err != nil {
+			return fmt.Errorf("dropping pr_next_scores: %w", err)
+		}
+	}
+
+	// 4. Final Calculation & Update Main Table
+	log.Println("Calculating final composite scores and updating crawled_pages...")
+
+	// Update crawled_pages with calculated metrics
+	// Freshness: max(0, 1 - (AgeInDays / 365))
+	// Quality: log10(text_length)
+	// Lith Score: Weighted sum
+	_, err = tx.Exec(ctx, `
+		UPDATE crawled_pages cp
+		SET
+			lith_score = res.final_score,
+			freshness_score = res.freshness,
+			quality_score = res.quality
+		FROM (
+			SELECT
+				n.id,
+				GREATEST(0, 1.0 - (EXTRACT(EPOCH FROM (NOW() - COALESCE(cp.crawled_at, NOW()))) / (86400.0 * 365.0))) as freshness,
+				CASE WHEN cp.text_length > 0 THEN LOG(cp.text_length) ELSE 0 END as quality,
+				n.score as raw_pr
+			FROM pr_nodes n
+			JOIN crawled_pages cp ON n.id = cp.id
+		) res
+		WHERE cp.id = res.id AND (
+             cp.lith_score IS DISTINCT FROM ((res.raw_pr * 0.8) + (res.freshness * 0.1) + (res.quality * 0.1))
+             OR cp.freshness_score IS DISTINCT FROM res.freshness
+             OR cp.quality_score IS DISTINCT FROM res.quality
+        );
+	`)
+
+	// Retrying the query with correct structure
+	_, err = tx.Exec(ctx, `
+		WITH metrics AS (
+			SELECT
+				n.id,
+				GREATEST(0, 1.0 - (EXTRACT(EPOCH FROM (NOW() - COALESCE(cp.crawled_at, NOW()))) / (86400.0 * 365.0))) as freshness,
+				CASE WHEN cp.text_length > 0 THEN LOG(cp.text_length) ELSE 0 END as quality,
+				n.score as raw_pr
+			FROM pr_nodes n
+			JOIN crawled_pages cp ON n.id = cp.id
+		)
+		UPDATE crawled_pages cp
+		SET
+			lith_score = (m.raw_pr * 0.8) + (m.freshness * 0.1) + (m.quality * 0.1),
+			freshness_score = m.freshness,
+			quality_score = m.quality
+		FROM metrics m
+		WHERE cp.id = m.id
+	`)
+	if err != nil {
+		return fmt.Errorf("final update: %w", err)
+	}
+
 	return tx.Commit(ctx)
 }

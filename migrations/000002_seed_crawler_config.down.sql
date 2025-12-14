@@ -1,0 +1,1 @@
+DELETE FROM crawler_config WHERE key = 'default';

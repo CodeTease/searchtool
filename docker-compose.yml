@@ -23,6 +23,19 @@ services:
     networks:
       - teaser_net
 
+  # Migration Service
+  migrate:
+    image: migrate/migrate
+    restart: on-failure
+    volumes:
+      - ./migrations:/migrations
+    command: ["-path", "/migrations", "-database", "postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}?sslmode=disable", "up"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - teaser_net
+
   # Redis/Valkey: Queue
   redis:
     image: redis:7-alpine
@@ -87,6 +100,7 @@ services:
       MINIO_ENDPOINT: minio:9000
       MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY}
       MINIO_SECRET_KEY: ${MINIO_SECRET_KEY}
+      ADMIN_USERNAME: ${ADMIN_USERNAME}
       ADMIN_PASSWORD: ${ADMIN_PASSWORD}
     volumes:
       # Mount Go source code to /app
@@ -96,8 +110,12 @@ services:
     ports:
       - "8080:8080"
     depends_on:
-      - postgres
-      - redis
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+      migrate:
+        condition: service_completed_successfully
     networks:
       - teaser_net
 
@@ -118,9 +136,14 @@ services:
       # Ensure config path is consistent
       - crawler_config:/app/crawler
     depends_on:
-      - postgres
-      - redis
-      - minio
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+      migrate:
+        condition: service_completed_successfully
+      minio:
+        condition: service_started
     networks:
       - teaser_net
 
@@ -143,6 +166,8 @@ services:
         condition: service_healthy
       meilisearch:
         condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
     networks:
       - teaser_net
 
@@ -182,6 +207,8 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
     networks:
       - teaser_net
 
