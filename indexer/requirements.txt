@@ -1,5 +1,5 @@
 asyncpg
-meilisearch
+meilisearch-python-sdk
 python-dotenv
 minio
 beautifulsoup4

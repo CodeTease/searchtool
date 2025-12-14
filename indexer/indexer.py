@@ -1,7 +1,7 @@
 import os
 import asyncio
 import asyncpg
-import meilisearch.aio
+from meilisearch_python_sdk import AsyncClient
 from dotenv import load_dotenv
 import logging
 import signal
@@ -147,7 +147,7 @@ async def main():
         db_pool = await asyncpg.create_pool(DATABASE_URL)
         
         logging.info(f"Connecting to Meilisearch at {MEILI_HOST}...")
-        meili_client = meilisearch.aio.Client(url=MEILI_HOST, api_key=MEILI_API_KEY)
+        meili_client = AsyncClient(url=MEILI_HOST, api_key=MEILI_API_KEY)
 
         # --- MinIO Connection ---
         if MINIO_ACCESS_KEY and MINIO_SECRET_KEY:
