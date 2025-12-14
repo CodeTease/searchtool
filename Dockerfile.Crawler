@@ -20,7 +20,7 @@ COPY crawler/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Tải model FastText từ Teaserverse Public Asset
-RUN curl -fsSL -o /app/lid.176.bin -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" https://cdn.teaserverse.online/codetease/lumix/lid.176.bin 
+RUN curl -fsSL -o /app/lid.176.bin https://cdn.teaserverse.online/codetease/lumix/lid.176.bin 
 
 # Copy toàn bộ mã nguồn crawler
 COPY crawler.py .

@@ -597,7 +597,7 @@ async def main():
     
     # Default config structure
     default_config = {
-        'start_urls': ['https://teaserverse.dev'],
+        'start_urls': ['https://teaserverse.online'],
         'max_depth': 1,
         'save_to_db': True
     }
@@ -608,7 +608,7 @@ async def main():
     # Merge: DB config overrides defaults
     config = {**default_config, **db_config}
     
-    start_urls = config.get('start_urls', ['https://teaserverse.dev'])
+    start_urls = config.get('start_urls', ['https://teaserverse.online'])
     
     crawler = WebCrawler(start_urls, config)
     

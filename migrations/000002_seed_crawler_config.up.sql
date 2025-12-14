@@ -1,5 +1,5 @@
 INSERT INTO crawler_config (key, value) VALUES ('default', '{
-  "start_urls": ["https://teaserverse.dev"],
+  "start_urls": ["https://teaserverse.online"],
   "max_depth": 1,
   "max_concurrent_requests": 5,
   "delay_per_domain": 1.0,
