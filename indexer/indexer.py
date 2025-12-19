@@ -2,6 +2,8 @@ import os
 import asyncio
 import asyncpg
 from meilisearch_python_sdk import AsyncClient
+# [FIX] Import model settings 
+from meilisearch_python_sdk.models.settings import MeilisearchSettings 
 from dotenv import load_dotenv
 import logging
 import signal
@@ -101,39 +103,6 @@ async def cleanup_deleted_pages(db_pool, meili_client):
                 deleted_count += len(ids_to_delete)
                 logging.info(f"Deleted batch of {len(ids_to_delete)} stale documents.")
             
-            # If we deleted documents, pagination shifts?
-            # MeiliSearch documentation says "When you delete documents, the offset is not shifted automatically."
-            # Actually if we delete docs from the current page, the next page might shift into the current offset.
-            # However, since we are iterating by offset, if we delete, the subsequent documents shift up.
-            # BUT we are processing in a snapshot-like manner? No.
-            # If we delete, the total count decreases.
-            # If we keep increasing offset, we might skip documents.
-            # To be safe: if we deleted anything, we shouldn't increase offset?
-            # Or simpler: Just accept that cleanup might miss some if they shift, and catch them next time.
-            # OR better: Iterate by filter? No, standard pagination.
-            #
-            # If we delete N docs from offset X, the docs at X+N shift to X.
-            # So next batch should be fetched from X?
-            # Wait, get_documents returns documents.
-            # If we delete them, they are gone.
-            # If we delete ALL in this batch, the next batch is now at the current offset.
-            # If we delete NONE, the next batch is at offset + limit.
-            # If we delete SOME, say K, then K docs from next pages shift into current range [offset, offset+limit].
-            # This is complex with simple offset pagination.
-            
-            # Since cleanup is not super time-sensitive to be perfect in one pass, 
-            # and missing a few is okay (catch next time), 
-            # let's stick to standard offset increment to avoid infinite loops if deletion fails or lags.
-            # But technically, "offset += limit" is correct only if we assume the list is stable. It is not.
-            #
-            # Actually, if we use `get_documents` without specific order, it usually uses internal ID order.
-            # If we delete, the order might change.
-            #
-            # Alternative: Use keyset pagination if available? Meili doesn't support it easily for all docs.
-            #
-            # Let's just increment offset. If we miss some due to shift, it's fine.
-            # The OOM fix is the priority.
-            
             offset += limit
             # Simple yield to event loop
             await asyncio.sleep(0.01)
@@ -183,7 +152,8 @@ async def main():
         await meili_client.create_index(INDEX_NAME, primary_key='url')
 
         logging.info("Updating Lith Rank settings for index...")
-        settings = {
+        
+        settings_dict = {
             'searchableAttributes': ['title', 'body_text', 'meta_description'],
             'filterableAttributes': ['domain', 'language'],
             'sortableAttributes': ['crawled_at', 'lith_score'],
@@ -197,7 +167,10 @@ async def main():
                 'lith_score:desc' 
             ]
         }
-        await meili_client.index(INDEX_NAME).update_settings(settings)
+        
+        # [FIX] Wrap settings dict in MeilisearchSettings model
+        await meili_client.index(INDEX_NAME).update_settings(MeilisearchSettings(**settings_dict))
+        
         logging.info("Index settings updated.")
 
     except Exception as e:

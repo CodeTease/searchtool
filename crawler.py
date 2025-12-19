@@ -132,7 +132,7 @@ class WebCrawler:
     
     def _init_language_detector(self):
         """Loads FastText model on crawler startup."""
-        model_path = "/app/lid.176.bin"
+        model_path = "/var/local/lid.176.bin"
         if not os.path.exists(model_path):
             console.print(f"[bold red]Error: Language detection model '{model_path}' does not exist.[/bold red]")
             return None
