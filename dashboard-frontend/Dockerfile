@@ -1,5 +1,5 @@
 # Stage 1: Build the Next.js application
-FROM node:20-alpine AS builder
+FROM node:22-alpine AS builder
 
 # Set the working directory
 WORKDIR /app
@@ -17,7 +17,7 @@ COPY . .
 RUN npm run build
 
 # Stage 2: Create the production image
-FROM node:20-alpine
+FROM node:22-alpine
 
 # Set the working directory
 WORKDIR /app

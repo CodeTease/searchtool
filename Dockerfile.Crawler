@@ -1,5 +1,5 @@
 # Sử dụng image Python nhẹ
-FROM python:3.11-slim
+FROM python:3.12-slim
 
 # Cài đặt các gói hệ thống cần thiết cho C/C++ build và libpq (PostgreSQL)
 RUN apt-get update && apt-get install -y --no-install-recommends \
